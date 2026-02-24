@@ -30,7 +30,7 @@ for /r ".\start" %%F in (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.mp4 *.mkv *.ts *
       exit /b 1
     )
 
-    py -3 -m app --project_root . --srt "output/%%~nF/%%~nF.en.srt" --model_dir models/indexTTS2 --gap_fill_mode zero --sr 22050 --audio_bitrate 256k --open_progress_window
+    py -3 -m app --project_root . --srt "output/%%~nF/%%~nF.en.srt" --model_dir models/indexTTS2 --gap_fill_mode zero --sr 22050 --audio_bitrate 320k --open_progress_window
     if errorlevel 1 (
       echo [ERROR] AGENT2 failed: output/%%~nF/%%~nF.en.srt
       exit /b 1
@@ -60,5 +60,6 @@ if exist "%P_DIR%%P_STEM%.webm" set "%P_OUT_VAR%=1"
 if exist "%P_DIR%%P_STEM%.m4v"  set "%P_OUT_VAR%=1"
 
 exit /b 0
+
 
 

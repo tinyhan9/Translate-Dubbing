@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import gc
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report_dir", help="Directory for report json files")
     p.add_argument("--sr", type=int, default=22050, help="Output sample rate")
     p.add_argument("--mono", action="store_true", default=False, help="Output mono audio (default: stereo)")
-    p.add_argument("--audio_bitrate", default="256k", help="Output audio bitrate (default: 256k)")
+    p.add_argument("--audio_bitrate", default="320k", help="Output audio bitrate (default: 320k)")
     p.add_argument("--gap_fill_mode", choices=["zero", "noise_bed"], default="zero")
     p.add_argument("--mock_tts", action="store_true", help="Use internal mock TTS for testing")
     p.add_argument("--batch_items", type=int, default=1, help="Max subtitle items per TTS batch (1 disables batching)")
@@ -393,3 +393,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

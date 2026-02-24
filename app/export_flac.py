@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -10,7 +10,7 @@ def export_flac(
     output_flac: Path,
     sr: int = 22050,
     mono: bool = True,
-    audio_bitrate: str = "256k",
+    audio_bitrate: str = "320k",
 ) -> None:
     output_flac.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -31,3 +31,4 @@ def export_flac(
         str(output_flac),
     ]
     run_cmd(cmd, f"Failed to export FLAC {output_flac}")
+

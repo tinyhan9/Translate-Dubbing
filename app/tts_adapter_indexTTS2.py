@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import os
@@ -195,7 +195,7 @@ class IndexTTS2Adapter:
         model_dir: Path,
         sr: int = 22050,
         mono: bool = True,
-        audio_bitrate: str = "256k",
+        audio_bitrate: str = "320k",
         cmd_template: str | None = None,
         mock_tts: bool = False,
         prefer_fast: bool = True,
@@ -505,3 +505,4 @@ class IndexTTS2Adapter:
         if self._worker is not None:
             self._worker.close()
             self._worker = None
+

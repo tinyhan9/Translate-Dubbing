@@ -28,7 +28,7 @@
   - `output/demo/demo.en.srt` -> `output/demo/demo.flac`
   - `output/demo/demo.srt` -> `output/demo/demo.flac`
 - 报告：`output/reports/<name>.report.json`
-- 统一规格：`22.05kHz`、`stereo`、`16-bit`、`256kbps`
+- 统一规格：`22.05kHz`、`stereo`、`16-bit`、`320kbps`
 
 ## 2) 强约束
 - 不读取根目录 MP3 作为文本来源。
@@ -112,7 +112,7 @@ py -3 -m app \
 - 单次运行有且仅有一个 CMD 监视窗口。
 - `--log_file`：自定义进度日志路径。
 - `--quiet`：关闭主终端进度输出（监控窗口/日志仍可用）。
-- `--audio_bitrate`：导出音频码率（默认 `256k`）。
+- `--audio_bitrate`：导出音频码率（默认 `320k`）。
 - `--mono`：切换为单声道导出（默认双声道）。
 
 ## 5) 返回码
@@ -121,3 +121,4 @@ py -3 -m app \
 - `3`：SRT 解析失败
 - `4`：TTS 推理失败
 - `5`：音频处理或导出失败
+
