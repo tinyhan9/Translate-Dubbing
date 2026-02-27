@@ -1117,7 +1117,7 @@ def write_backend_report(
 ) -> Path:
     media_out_dir.mkdir(parents=True, exist_ok=True)
     asr_label = "在线识别" if asr_mode == "online" else "本地识别"
-    translate_label = "在线识别" if translate_mode == "online" else "本地识别"
+    translate_label = "在线翻译" if translate_mode == "online" else "本地翻译"
     report_path = media_out_dir / f"{base_name}.backend.txt"
     content = "\n".join(
         [
@@ -1690,6 +1690,47 @@ def translate_entries_with_rightcode(
     return out
 
 
+def translate_entries_with_local_whisper(
+    *,
+    audio_file: Path,
+    zh_entries: Sequence[SubtitleEntry],
+    model_size: str,
+    model_dir: Path,
+    log_file: Path,
+    audio_duration_seconds: float,
+) -> list[str]:
+    if not zh_entries:
+        append_log(log_file, "translate progress: 100.0%")
+        return []
+
+    append_log(log_file, "Switching to local translate backend (whisper)")
+    model = None
+    try:
+        import whisper
+    except Exception as exc:  # pragma: no cover - import depends on environment
+        raise WorkflowError(f"Failed to import whisper for local translate fallback: {exc}") from exc
+
+    model_name = choose_model_name(model_dir, model_size)
+    try:
+        model = whisper.load_model(model_name, download_root=str(model_dir))
+    except Exception as exc:  # pragma: no cover - runtime model loading
+        raise WorkflowError(f"Failed to load whisper model {model_name} for local translate fallback: {exc}") from exc
+
+    try:
+        translate_result = run_whisper_with_retry(
+            model,
+            audio_file,
+            task="translate",
+            language="zh",
+            log_file=log_file,
+            audio_duration_seconds=audio_duration_seconds,
+        )
+        en_segments = translate_result.get("segments", [])
+        return align_english_to_zh(zh_entries, en_segments)
+    finally:
+        release_runtime(model, log_file)
+
+
 def generate_subtitles_local(
     root: Path,
     requested_audio: str | None,
@@ -1831,6 +1872,8 @@ def generate_subtitles_local(
 def generate_subtitles_online(
     root: Path,
     requested_audio: str | None,
+    model_size: str,
+    model_dir: Path,
     out_dir: Path,
     raw_dir: Path,
     log_file: Path,
@@ -1886,6 +1929,7 @@ def generate_subtitles_online(
         terms = extract_terms(full_text)
         terms_path.write_text("\n".join(terms) + ("\n" if terms else ""), encoding="utf-8")
 
+        translate_mode = "online"
         try:
             en_lines = translate_entries_with_rightcode(zh_entries, translate_cfg, log_file)
             en_entries = [
@@ -1906,9 +1950,29 @@ def generate_subtitles_online(
                 write_srt(en_entries, en_path)
                 write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
         except Exception as exc:
-            if _is_network_exception(exc):
-                raise NetworkWorkflowError(f"Online translation failed: {exc}") from exc
-            append_log(log_file, f"Translation stage failed, kept zh only: {exc}")
+            append_log(log_file, f"Online translation failed, switching to local translation: {exc}")
+            try:
+                en_lines = translate_entries_with_local_whisper(
+                    audio_file=audio_file,
+                    zh_entries=zh_entries,
+                    model_size=model_size,
+                    model_dir=model_dir,
+                    log_file=log_file,
+                    audio_duration_seconds=audio_duration_seconds,
+                )
+                en_entries = [
+                    SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
+                    for idx, item in enumerate(zh_entries)
+                ]
+                write_srt(en_entries, en_path)
+                write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
+                translate_mode = "local"
+
+                bi_entries = parse_srt(bi_path)
+                if not verify_alignment(zh_entries, en_entries, bi_entries):
+                    append_log(log_file, "Alignment validation failed after local translate fallback")
+            except Exception as fallback_exc:
+                append_log(log_file, f"Local translate fallback failed, kept zh only: {fallback_exc}")
 
         ensure_srt_parseable(zh_path)
         if en_path.exists():
@@ -1919,7 +1983,7 @@ def generate_subtitles_online(
             media_out_dir,
             base_name,
             asr_mode="online",
-            translate_mode="online",
+            translate_mode=translate_mode,
         )
 
         outputs = {
@@ -1959,6 +2023,8 @@ def run_single_media_with_backends(
                 outputs = generate_subtitles_online(
                     root=root,
                     requested_audio=str(media),
+                    model_size=model_size,
+                    model_dir=model_dir,
                     out_dir=out_dir,
                     raw_dir=raw_dir,
                     log_file=log_file,
@@ -1966,12 +2032,12 @@ def run_single_media_with_backends(
                     translate_cfg=translate_cfg,
                 )
                 return outputs, backends
-            except NetworkWorkflowError as exc:
-                append_log(log_file, f"Online mode network failure attempt {attempt}: {exc}")
-                if attempt == 1:
+            except WorkflowError as exc:
+                append_log(log_file, f"Online mode failed attempt {attempt}: {exc}")
+                if attempt == 1 and _is_network_exception(exc):
                     append_log(log_file, "Retry online mode once because of network failure")
                     continue
-                append_log(log_file, "Switching to local mode after online network failure")
+                append_log(log_file, "Switching to local mode after online ASR failure")
                 break
         local_backends = RuntimeBackends(asr_mode="local", translate_mode="local")
         outputs = generate_subtitles_local(
