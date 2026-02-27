@@ -11,7 +11,7 @@
 
 # 其他说明
 0. 模型放到 `models` 文件夹，下载 `indexTTS2`、`whisper`、`hf_cache`。
-1. `ref-audio` 放置参考音色的音频文件，根目录下仅放置一个即可，如 `ref-audio\\TINY.wav`。
+1. `ref-audio` 放置参考音色的音频文件，根目录下仅放置一个即可，如 `ref-audio\TINY.wav'。
 2. 双击运行 `cleanup_start.bat`，会清理 `start` 文件夹内所有文件。
 3. 双击运行 `cleanup_workspace_full.bat`，会清理 `output` 生成的文件和其他缓存。
 4. 如果 `start` 放入的是视频文件，项目根目录会自动生成一个音频文件，不要动它。等程序运行完毕，可按第 3 步进行清理。
@@ -20,4 +20,4 @@
 
 # 模型下载地址
 https://pan.baidu.com/s/1TgxvKX5LQL4iV_ROVr2UFA?pwd=8mzd  
-默认情况下，程序未读取到模型会自动下载。
+默认情况下，程序未读取到模型会自动下载(强烈建议网盘下载)。
