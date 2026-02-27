@@ -1,0 +1,9 @@
+{
+  "rightcode_translate": {
+    "api_key": "",
+    "base_url": "",
+    "model": "gpt-5.2",
+    "timeout_seconds": 90,
+    "batch_size": 20
+  }
+}

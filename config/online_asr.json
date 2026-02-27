@@ -1,0 +1,23 @@
+{
+  "doubao_asr": {
+    "app_id": "",
+    "access_token": "",
+    "secret_key": "",
+    "api_version": "v3_flash",
+    "recognize_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+    "resource_id": "volc.bigasr.auc_turbo",
+    "request_timeout_seconds": 300,
+    "max_audio_size_mb": 100,
+    "cluster": "volcengine_input_common",
+    "service_url": "https://openspeech.bytedance.com/api/v1/auc",
+    "poll_interval_seconds": 2.0,
+    "max_wait_seconds": 1200,
+    "language": "",
+    "speech_noise_threshold": 0.8,
+    "upload": {
+      "enabled": true,
+      "endpoint": "https://transfer.sh",
+      "timeout_seconds": 180
+    }
+  }
+}

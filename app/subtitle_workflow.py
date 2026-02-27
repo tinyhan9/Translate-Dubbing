@@ -1,19 +1,29 @@
 ﻿from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import gc
 import json
 import math
 import os
+import queue
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".ts", ".mov", ".avi", ".webm", ".m4v"}
@@ -97,6 +107,9 @@ TERM_NORMALIZE_MAP = {
     "tyler": "tiny",
     "valum": "vellum",
 }
+DEFAULT_ONLINE_ASR_CONFIG = "config/online_asr.json"
+DEFAULT_ONLINE_TRANSLATE_CONFIG = "config/online_translate.json"
+DOUBAO_AUC_API = "https://openspeech.bytedance.com/api/v1/auc"
 
 
 @dataclass
@@ -109,6 +122,49 @@ class SubtitleEntry:
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class NetworkWorkflowError(WorkflowError):
+    pass
+
+
+@dataclass(frozen=True)
+class OnlineASRConfig:
+    app_id: str
+    access_token: str
+    secret_key: str
+    cluster: str
+    api_version: str = "v3_flash"
+    recognize_url: str = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+    resource_id: str = "volc.bigasr.auc_turbo"
+    request_timeout_seconds: int = 300
+    max_audio_size_mb: int = 100
+    service_url: str = DOUBAO_AUC_API
+    upload_enabled: bool = True
+    upload_endpoint: str = "https://transfer.sh"
+    upload_timeout_seconds: int = 180
+    poll_interval_seconds: float = 2.0
+    max_wait_seconds: int = 1200
+    language: str | None = None
+    channel: int = 1
+    sample_rate: int = 16000
+    codec: str = "raw"
+    speech_noise_threshold: float = 0.8
+
+
+@dataclass(frozen=True)
+class OnlineTranslateConfig:
+    api_key: str
+    base_url: str
+    model: str
+    timeout_seconds: int = 90
+    batch_size: int = 20
+
+
+@dataclass(frozen=True)
+class RuntimeBackends:
+    asr_mode: str
+    translate_mode: str
 
 
 def append_log(log_file: Path, message: str) -> None:
@@ -1052,7 +1108,589 @@ def ensure_srt_parseable(path: Path) -> None:
     _ = parse_srt(path)
 
 
-def generate_subtitles(
+def write_backend_report(
+    media_out_dir: Path,
+    base_name: str,
+    *,
+    asr_mode: str,
+    translate_mode: str,
+) -> Path:
+    media_out_dir.mkdir(parents=True, exist_ok=True)
+    asr_label = "在线识别" if asr_mode == "online" else "本地识别"
+    translate_label = "在线识别" if translate_mode == "online" else "本地识别"
+    report_path = media_out_dir / f"{base_name}.backend.txt"
+    content = "\n".join(
+        [
+            "字幕流程方式说明",
+            f"字幕识别最终方式: {asr_label}",
+            f"字幕翻译最终方式: {translate_label}",
+            "",
+        ]
+    )
+    report_path.write_text(content, encoding="utf-8", newline="\n")
+    return report_path
+
+
+def read_json_config(config_path: Path) -> dict:
+    if not config_path.exists():
+        raise WorkflowError(f"Config file not found: {config_path}")
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise WorkflowError(f"Invalid JSON config: {config_path} | {exc}") from exc
+    if not isinstance(raw, dict):
+        raise WorkflowError(f"Config root must be object: {config_path}")
+    return raw
+
+
+def load_online_asr_config(config_path: Path) -> OnlineASRConfig:
+    raw = read_json_config(config_path)
+    cfg = raw.get("doubao_asr", raw)
+    if not isinstance(cfg, dict):
+        raise WorkflowError(f"Invalid doubao_asr config object: {config_path}")
+
+    def _need(key: str) -> str:
+        value = str(cfg.get(key, "")).strip()
+        if not value:
+            raise WorkflowError(f"Missing required ASR config key: {key} ({config_path})")
+        return value
+
+    upload_cfg = cfg.get("upload", {})
+    if not isinstance(upload_cfg, dict):
+        upload_cfg = {}
+
+    language_raw = str(cfg.get("language", "")).strip()
+    return OnlineASRConfig(
+        app_id=_need("app_id"),
+        access_token=_need("access_token"),
+        secret_key=_need("secret_key"),
+        cluster=str(cfg.get("cluster", "volcengine_input_common")).strip() or "volcengine_input_common",
+        api_version=str(cfg.get("api_version", "v3_flash")).strip() or "v3_flash",
+        recognize_url=(
+            str(
+                cfg.get(
+                    "recognize_url",
+                    "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+                )
+            ).strip()
+            or "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+        ),
+        resource_id=str(cfg.get("resource_id", "volc.bigasr.auc_turbo")).strip() or "volc.bigasr.auc_turbo",
+        request_timeout_seconds=max(int(cfg.get("request_timeout_seconds", 300)), 10),
+        max_audio_size_mb=max(int(cfg.get("max_audio_size_mb", 100)), 1),
+        service_url=str(cfg.get("service_url", DOUBAO_AUC_API)).strip() or DOUBAO_AUC_API,
+        upload_enabled=bool(upload_cfg.get("enabled", True)),
+        upload_endpoint=str(upload_cfg.get("endpoint", "https://transfer.sh")).strip() or "https://transfer.sh",
+        upload_timeout_seconds=max(int(upload_cfg.get("timeout_seconds", 180)), 10),
+        poll_interval_seconds=max(float(cfg.get("poll_interval_seconds", 2.0)), 0.2),
+        max_wait_seconds=max(int(cfg.get("max_wait_seconds", 1200)), 30),
+        language=language_raw or None,
+        channel=max(int(cfg.get("channel", 1)), 1),
+        sample_rate=max(int(cfg.get("sample_rate", 16000)), 8000),
+        codec=str(cfg.get("codec", "raw")).strip() or "raw",
+        speech_noise_threshold=float(cfg.get("speech_noise_threshold", 0.8)),
+    )
+
+
+def load_online_translate_config(config_path: Path) -> OnlineTranslateConfig:
+    raw = read_json_config(config_path)
+    cfg = raw.get("rightcode_translate", raw)
+    if not isinstance(cfg, dict):
+        raise WorkflowError(f"Invalid rightcode_translate config object: {config_path}")
+
+    def _need(key: str) -> str:
+        value = str(cfg.get(key, "")).strip()
+        if not value:
+            raise WorkflowError(f"Missing required translate config key: {key} ({config_path})")
+        return value
+
+    return OnlineTranslateConfig(
+        api_key=_need("api_key"),
+        base_url=_need("base_url"),
+        model=_need("model"),
+        timeout_seconds=max(int(cfg.get("timeout_seconds", 90)), 10),
+        batch_size=max(int(cfg.get("batch_size", 20)), 1),
+    )
+
+
+def choose_runtime_mode_interactive(timeout_seconds: int = 5) -> str:
+    print(
+        "请选择识别方式：1=在线大模型识别+翻译，2=本地模型识别。"
+        f"{timeout_seconds}秒内不输入将默认选择1。",
+        flush=True,
+    )
+    print("请输入 1 或 2: ", end="", flush=True)
+
+    answer_q: queue.Queue[str] = queue.Queue(maxsize=1)
+
+    def _read_input() -> None:
+        try:
+            value = input().strip()
+        except EOFError:
+            return
+        if value not in {"1", "2"}:
+            return
+        try:
+            answer_q.put_nowait(value)
+        except queue.Full:
+            pass
+
+    worker = threading.Thread(target=_read_input, daemon=True)
+    worker.start()
+
+    try:
+        value = answer_q.get(timeout=timeout_seconds).strip()
+    except queue.Empty:
+        print("", flush=True)
+        return "online"
+
+    return "local" if value == "2" else "online"
+
+
+def _is_network_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (NetworkWorkflowError, TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, urlerror.URLError):
+        return True
+    if isinstance(exc, OSError) and exc.errno in {101, 110, 111, 113}:
+        return True
+    return False
+
+
+def _http_json_request(
+    *,
+    url: str,
+    payload: dict,
+    timeout_seconds: int,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urlrequest.Request(url=url, data=body, headers=req_headers, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code >= 500:
+            raise NetworkWorkflowError(f"HTTP {exc.code} on {url}: {detail}") from exc
+        raise WorkflowError(f"HTTP {exc.code} on {url}: {detail}") from exc
+    except Exception as exc:
+        if _is_network_exception(exc):
+            raise NetworkWorkflowError(f"Network error on {url}: {exc}") from exc
+        raise
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise WorkflowError(f"Invalid JSON response from {url}: {raw[:500]}") from exc
+    if not isinstance(parsed, dict):
+        raise WorkflowError(f"Invalid response object from {url}")
+    return parsed
+
+
+def _upload_audio_to_temp_url(audio_file: Path, cfg: OnlineASRConfig, log_file: Path) -> str:
+    if not cfg.upload_enabled:
+        raise WorkflowError("Online ASR upload is disabled in config; cannot build publicly reachable audio URL")
+
+    quoted_name = urlparse.quote(audio_file.name)
+    target = f"{cfg.upload_endpoint.rstrip('/')}/{quoted_name}"
+    append_log(log_file, f"Online ASR upload start: {audio_file.name}")
+
+    curl_bin = shutil.which("curl")
+    if curl_bin:
+        cmd = [
+            curl_bin,
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            str(cfg.upload_timeout_seconds),
+            "--upload-file",
+            str(audio_file),
+            target,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            uploaded = proc.stdout.strip()
+            if uploaded.startswith("http://") or uploaded.startswith("https://"):
+                append_log(log_file, f"Online ASR upload done: {uploaded}")
+                return uploaded
+
+    try:
+        data = audio_file.read_bytes()
+    except Exception as exc:
+        raise WorkflowError(f"Failed to read audio for upload: {audio_file} | {exc}") from exc
+
+    req = urlrequest.Request(url=target, data=data, method="PUT")
+    req.add_header("Max-Days", "1")
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urlrequest.urlopen(req, timeout=cfg.upload_timeout_seconds) as resp:
+            uploaded = resp.read().decode("utf-8", errors="replace").strip()
+    except Exception as exc:
+        if _is_network_exception(exc):
+            raise NetworkWorkflowError(f"Failed to upload audio for online ASR: {exc}") from exc
+        raise WorkflowError(f"Failed to upload audio for online ASR: {exc}") from exc
+
+    if not (uploaded.startswith("http://") or uploaded.startswith("https://")):
+        raise WorkflowError(f"Upload endpoint did not return URL: {uploaded[:200]}")
+    append_log(log_file, f"Online ASR upload done: {uploaded}")
+    return uploaded
+
+
+def _extract_doubao_utterances(raw: dict) -> list[dict]:
+    utterances = raw.get("utterances")
+    if isinstance(utterances, list):
+        return [u for u in utterances if isinstance(u, dict)]
+
+    result = raw.get("result")
+    if isinstance(result, dict):
+        inner = result.get("utterances")
+        if isinstance(inner, list):
+            return [u for u in inner if isinstance(u, dict)]
+    if isinstance(result, list):
+        merged: list[dict] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            inner = item.get("utterances")
+            if isinstance(inner, list):
+                merged.extend(u for u in inner if isinstance(u, dict))
+        if merged:
+            return merged
+    return []
+
+
+def _to_seconds_from_maybe_ms(raw: object) -> float:
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except Exception:
+        return 0.0
+    if abs(value) > 1000:
+        return value / 1000.0
+    if isinstance(raw, int):
+        return value / 1000.0
+    return value
+
+
+def _build_transcribe_result_from_doubao(raw_query: dict) -> dict:
+    utterances = _extract_doubao_utterances(raw_query)
+    segments: list[dict] = []
+    for idx, utt in enumerate(utterances, start=1):
+        text = str(utt.get("text", "")).strip()
+        if not text:
+            continue
+        start = _to_seconds_from_maybe_ms(utt.get("start_time", utt.get("start", 0)))
+        end = _to_seconds_from_maybe_ms(utt.get("end_time", utt.get("end", start)))
+        if end <= start:
+            end = start + 0.4
+        segments.append({"id": idx, "start": start, "end": end, "text": text})
+
+    full_text = " ".join(seg["text"] for seg in segments).strip()
+    if not full_text:
+        result = raw_query.get("result")
+        if isinstance(result, dict):
+            full_text = str(result.get("text", "")).strip()
+    if not full_text:
+        full_text = str(raw_query.get("text", "")).strip()
+    if not segments and full_text:
+        segments.append({"id": 1, "start": 0.0, "end": 2.0, "text": full_text})
+    return {"text": full_text, "segments": segments, "raw_query": raw_query}
+
+
+def _run_doubao_v3_flash_once(audio_file: Path, cfg: OnlineASRConfig, log_file: Path) -> dict:
+    try:
+        audio_bytes = audio_file.read_bytes()
+    except Exception as exc:
+        raise WorkflowError(f"Failed to read audio file: {audio_file} | {exc}") from exc
+    append_log(log_file, "transcribe progress: 12.0%")
+
+    if len(audio_bytes) > cfg.max_audio_size_mb * 1024 * 1024:
+        raise WorkflowError(
+            f"Audio file too large for v3 flash ({len(audio_bytes)} bytes), "
+            f"max={cfg.max_audio_size_mb}MB"
+        )
+
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    append_log(log_file, "transcribe progress: 28.0%")
+    payload = {
+        "user": {"uid": cfg.app_id},
+        "audio": {"data": audio_b64},
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_ddc": True,
+            "show_utterances": True,
+            "result_type": "single",
+        },
+    }
+
+    req = urlrequest.Request(
+        url=cfg.recognize_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Api-App-Key": cfg.app_id,
+            "X-Api-Access-Key": cfg.access_token,
+            "X-Api-Resource-Id": cfg.resource_id,
+            "X-Api-Request-Id": str(uuid.uuid4()),
+            "X-Api-Sequence": "-1",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=cfg.request_timeout_seconds) as resp:
+            status_header = str(resp.headers.get("X-Api-Status-Code", "")).strip()
+            message_header = str(resp.headers.get("X-Api-Message", "")).strip()
+            raw_text = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code >= 500:
+            raise NetworkWorkflowError(f"Doubao v3 flash HTTP {exc.code}: {detail}") from exc
+        raise WorkflowError(f"Doubao v3 flash HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        if _is_network_exception(exc):
+            raise NetworkWorkflowError(f"Doubao v3 flash network error: {exc}") from exc
+        raise WorkflowError(f"Doubao v3 flash request failed: {exc}") from exc
+
+    append_log(log_file, "transcribe progress: 72.0%")
+    try:
+        parsed = json.loads(raw_text)
+    except Exception as exc:
+        raise WorkflowError(f"Doubao v3 flash invalid JSON response: {raw_text[:400]}") from exc
+    if not isinstance(parsed, dict):
+        raise WorkflowError(f"Doubao v3 flash invalid response object: {raw_text[:400]}")
+
+    if status_header and status_header != "20000000":
+        raise WorkflowError(
+            f"Doubao v3 flash status error: code={status_header}, message={message_header}, body={parsed}"
+        )
+    return _build_transcribe_result_from_doubao(parsed)
+
+
+def _run_doubao_v1_submit_query_once(audio_file: Path, cfg: OnlineASRConfig, log_file: Path) -> dict:
+    audio_url = _upload_audio_to_temp_url(audio_file, cfg, log_file)
+    submit_payload = {
+        "appid": cfg.app_id,
+        "token": cfg.access_token,
+        "cluster": cfg.cluster,
+        "audio": {
+            "url": audio_url,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "show_utterances": True,
+            "enable_itn": True,
+            "enable_ddc": True,
+            "result_type": "single",
+        },
+        "additions": {
+            "speech_noise_threshold": cfg.speech_noise_threshold,
+        },
+    }
+    if cfg.language:
+        submit_payload["additions"]["language"] = cfg.language
+
+    submit_resp = _http_json_request(
+        url=f"{cfg.service_url.rstrip('/')}/submit",
+        payload=submit_payload,
+        timeout_seconds=cfg.upload_timeout_seconds,
+    )
+    submit_code = int(submit_resp.get("code", -1))
+    if submit_code != 1000:
+        raise WorkflowError(f"Doubao ASR submit failed: {submit_resp}")
+
+    task_id = str(submit_resp.get("id", "")).strip()
+    if not task_id:
+        raise WorkflowError(f"Doubao ASR submit returned empty task id: {submit_resp}")
+
+    append_log(log_file, "transcribe progress: 5.0%")
+    query_payload = {
+        "appid": cfg.app_id,
+        "token": cfg.access_token,
+        "cluster": cfg.cluster,
+        "id": task_id,
+    }
+
+    started = time.monotonic()
+    last_bucket = -1
+    while True:
+        query_resp = _http_json_request(
+            url=f"{cfg.service_url.rstrip('/')}/query",
+            payload=query_payload,
+            timeout_seconds=cfg.upload_timeout_seconds,
+        )
+        code = int(query_resp.get("code", -1))
+        if code == 1000:
+            return _build_transcribe_result_from_doubao(query_resp)
+        if code < 2000:
+            raise WorkflowError(f"Doubao ASR query failed: {query_resp}")
+
+        elapsed = time.monotonic() - started
+        if elapsed > cfg.max_wait_seconds:
+            raise NetworkWorkflowError("Doubao ASR query timed out")
+        pct = min(95.0, 5.0 + (elapsed / cfg.max_wait_seconds) * 90.0)
+        bucket = int(pct // 2)
+        if bucket > last_bucket:
+            last_bucket = bucket
+            append_log(log_file, f"transcribe progress: {pct:.1f}%")
+        time.sleep(cfg.poll_interval_seconds)
+
+
+def run_doubao_asr_with_retry(
+    *,
+    audio_file: Path,
+    cfg: OnlineASRConfig,
+    log_file: Path,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            append_log(log_file, f"transcribe started (attempt {attempt})")
+            append_log(log_file, "transcribe progress: 0.0%")
+            if cfg.api_version == "v1_submit_query":
+                result = _run_doubao_v1_submit_query_once(audio_file, cfg, log_file)
+            else:
+                result = _run_doubao_v3_flash_once(audio_file, cfg, log_file)
+            append_log(log_file, "transcribe progress: 100.0%")
+            return result
+        except Exception as exc:
+            last_error = exc
+            append_log(log_file, f"transcribe attempt {attempt} failed: {exc}")
+            if attempt == 2:
+                if _is_network_exception(exc):
+                    raise NetworkWorkflowError(f"Doubao ASR failed after retry: {exc}") from exc
+                raise WorkflowError(f"Doubao ASR failed after retry: {exc}") from exc
+    assert last_error is not None
+    raise WorkflowError(f"Doubao ASR failed: {last_error}")
+
+
+def _extract_json_array_from_text(raw_text: str) -> list[str]:
+    text = raw_text.strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+    except Exception:
+        pass
+
+    mt = re.search(r"\[[\s\S]*\]", text)
+    if not mt:
+        raise WorkflowError(f"Translate response is not JSON array: {text[:300]}")
+    try:
+        parsed = json.loads(mt.group(0))
+    except Exception as exc:
+        raise WorkflowError(f"Failed to parse translate JSON array: {text[:300]}") from exc
+    if not isinstance(parsed, list):
+        raise WorkflowError("Translate response JSON is not an array")
+    return [str(x) for x in parsed]
+
+
+def _rightcode_translate_batch(
+    zh_lines: Sequence[str],
+    cfg: OnlineTranslateConfig,
+) -> list[str]:
+    prompt = (
+        "你是字幕翻译器。请把输入的中文数组逐条翻译为简短自然英文。"
+        "保持数组长度一致、顺序一致。仅返回JSON数组，不要任何额外文本。\n"
+        f"输入: {json.dumps(list(zh_lines), ensure_ascii=False)}"
+    )
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0.2,
+    }
+    resp = _http_json_request(
+        url=f"{cfg.base_url.rstrip('/')}/chat/completions",
+        payload=payload,
+        timeout_seconds=cfg.timeout_seconds,
+        headers={"Authorization": f"Bearer {cfg.api_key}"},
+    )
+    choices = resp.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        raise WorkflowError(f"Invalid translate response: {resp}")
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message", {}) if isinstance(first, dict) else {}
+    raw_content = str(message.get("content", "")).strip()
+    translated = _extract_json_array_from_text(raw_content)
+    if len(translated) != len(zh_lines):
+        # Fallback: translate line-by-line to guarantee one-to-one alignment.
+        repaired: list[str] = []
+        for line in zh_lines:
+            single_payload = {
+                "model": cfg.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"把这句中文翻成简短英文，只输出英文：{line}",
+                    }
+                ],
+                "stream": False,
+                "temperature": 0.2,
+            }
+            single_resp = _http_json_request(
+                url=f"{cfg.base_url.rstrip('/')}/chat/completions",
+                payload=single_payload,
+                timeout_seconds=cfg.timeout_seconds,
+                headers={"Authorization": f"Bearer {cfg.api_key}"},
+            )
+            single_choices = single_resp.get("choices", [])
+            if not isinstance(single_choices, list) or not single_choices:
+                repaired.append("")
+                continue
+            one = single_choices[0] if isinstance(single_choices[0], dict) else {}
+            one_msg = one.get("message", {}) if isinstance(one, dict) else {}
+            one_text = str(one_msg.get("content", "")).strip()
+            one_text = re.sub(r"^['\"`\s]+|['\"`\s]+$", "", one_text)
+            repaired.append(one_text)
+        translated = repaired
+    return translated
+
+
+def translate_entries_with_rightcode(
+    zh_entries: Sequence[SubtitleEntry],
+    cfg: OnlineTranslateConfig,
+    log_file: Path,
+) -> list[str]:
+    append_log(log_file, "translate started (attempt 1)")
+    append_log(log_file, "translate progress: 0.0%")
+    if not zh_entries:
+        append_log(log_file, "translate progress: 100.0%")
+        return []
+
+    out: list[str] = []
+    total = len(zh_entries)
+    for offset in range(0, total, cfg.batch_size):
+        batch = list(zh_entries[offset : offset + cfg.batch_size])
+        zh_lines = [item.text for item in batch]
+        translated = _rightcode_translate_batch(zh_lines, cfg)
+        for item, raw_en in zip(batch, translated):
+            duration = max(item.end - item.start, 0.4)
+            en_char_budget = max(28, min(72, int(duration * 20)))
+            out.append(compress_en_for_timing(raw_en, max_chars=en_char_budget))
+
+        done = min(total, offset + len(batch))
+        pct = min(99.0, (done / total) * 100.0)
+        append_log(log_file, f"translate progress: {pct:.1f}%")
+    append_log(log_file, "translate progress: 100.0%")
+    return out
+
+
+def generate_subtitles_local(
     root: Path,
     requested_audio: str | None,
     model_size: str,
@@ -1119,6 +1757,12 @@ def generate_subtitles(
 
         en_path = media_out_dir / f"{base_name}.en.srt"
         bi_path = media_out_dir / f"{base_name}.bi.srt"
+        for stale in (en_path, bi_path):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except Exception:
+                pass
 
         en_entries: list[SubtitleEntry] = []
         en_lines: list[str] = []
@@ -1161,12 +1805,19 @@ def generate_subtitles(
             ensure_srt_parseable(en_path)
         if bi_path.exists():
             ensure_srt_parseable(bi_path)
+        backend_report_path = write_backend_report(
+            media_out_dir,
+            base_name,
+            asr_mode="local",
+            translate_mode="local",
+        )
 
         outputs = {
             "audio": audio_file,
             "zh": zh_path,
             "summary": summary_path,
             "terms": terms_path,
+            "backend_report": backend_report_path,
         }
         if en_path.exists():
             outputs["en"] = en_path
@@ -1177,12 +1828,197 @@ def generate_subtitles(
         release_runtime(model, log_file)
 
 
+def generate_subtitles_online(
+    root: Path,
+    requested_audio: str | None,
+    out_dir: Path,
+    raw_dir: Path,
+    log_file: Path,
+    asr_cfg: OnlineASRConfig,
+    translate_cfg: OnlineTranslateConfig,
+) -> dict[str, Path]:
+    source_file = resolve_audio_file(root, requested_audio)
+    audio_file = source_file
+    if source_file.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+        audio_file = extract_mp3_from_video(source_file, root, log_file)
+    base_name = audio_file.stem
+    audio_duration_seconds = probe_duration_seconds(audio_file)
+    if audio_duration_seconds > 0:
+        append_log(log_file, f"Audio duration: {audio_duration_seconds:.1f}s")
+
+    try:
+        transcribe_result = run_doubao_asr_with_retry(
+            audio_file=audio_file,
+            cfg=asr_cfg,
+            log_file=log_file,
+        )
+        save_raw_outputs(raw_dir, base_name, transcribe_result)
+
+        raw_entries = entries_from_whisper_segments(transcribe_result.get("segments", []))
+        zh_entries = clean_and_split_zh_entries(raw_entries, max_zh_chars=18)
+        if not zh_entries:
+            raise WorkflowError("No subtitle entries remained after online cleaning")
+
+        if not validate_zh_entries(zh_entries):
+            repaired = clean_and_split_zh_entries(normalize_indices(zh_entries), max_zh_chars=18)
+            zh_entries = repaired
+            if not validate_zh_entries(zh_entries):
+                raise WorkflowError("zh subtitle validation failed after online auto-repair")
+
+        media_out_dir = out_dir / base_name
+        media_out_dir.mkdir(parents=True, exist_ok=True)
+        zh_path = media_out_dir / f"{base_name}.zh.srt"
+        en_path = media_out_dir / f"{base_name}.en.srt"
+        bi_path = media_out_dir / f"{base_name}.bi.srt"
+        for stale in (en_path, bi_path):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except Exception:
+                pass
+
+        write_srt(zh_entries, zh_path)
+
+        full_text = str(transcribe_result.get("text", ""))
+        summary_path = raw_dir.parent / f"{base_name}.summary.txt"
+        terms_path = raw_dir.parent / f"{base_name}.terms.txt"
+        summary_path.write_text(summarize_transcript(full_text), encoding="utf-8")
+        terms = extract_terms(full_text)
+        terms_path.write_text("\n".join(terms) + ("\n" if terms else ""), encoding="utf-8")
+
+        try:
+            en_lines = translate_entries_with_rightcode(zh_entries, translate_cfg, log_file)
+            en_entries = [
+                SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
+                for idx, item in enumerate(zh_entries)
+            ]
+            write_srt(en_entries, en_path)
+            write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
+
+            bi_entries = parse_srt(bi_path)
+            if not verify_alignment(zh_entries, en_entries, bi_entries):
+                append_log(log_file, "Alignment validation failed once, rebuilding online en/bi outputs")
+                en_lines = translate_entries_with_rightcode(zh_entries, translate_cfg, log_file)
+                en_entries = [
+                    SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
+                    for idx, item in enumerate(zh_entries)
+                ]
+                write_srt(en_entries, en_path)
+                write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
+        except Exception as exc:
+            if _is_network_exception(exc):
+                raise NetworkWorkflowError(f"Online translation failed: {exc}") from exc
+            append_log(log_file, f"Translation stage failed, kept zh only: {exc}")
+
+        ensure_srt_parseable(zh_path)
+        if en_path.exists():
+            ensure_srt_parseable(en_path)
+        if bi_path.exists():
+            ensure_srt_parseable(bi_path)
+        backend_report_path = write_backend_report(
+            media_out_dir,
+            base_name,
+            asr_mode="online",
+            translate_mode="online",
+        )
+
+        outputs = {
+            "audio": audio_file,
+            "zh": zh_path,
+            "summary": summary_path,
+            "terms": terms_path,
+            "backend_report": backend_report_path,
+        }
+        if en_path.exists():
+            outputs["en"] = en_path
+        if bi_path.exists():
+            outputs["bi"] = bi_path
+        return outputs
+    finally:
+        release_runtime(None, log_file)
+
+
+def run_single_media_with_backends(
+    *,
+    root: Path,
+    media: Path,
+    model_size: str,
+    model_dir: Path,
+    out_dir: Path,
+    raw_dir: Path,
+    log_file: Path,
+    backends: RuntimeBackends,
+    asr_cfg: OnlineASRConfig | None,
+    translate_cfg: OnlineTranslateConfig | None,
+) -> tuple[dict[str, Path], RuntimeBackends]:
+    if backends.asr_mode == "online":
+        if asr_cfg is None or translate_cfg is None:
+            raise WorkflowError("Online mode selected but online config is missing")
+        for attempt in (1, 2):
+            try:
+                outputs = generate_subtitles_online(
+                    root=root,
+                    requested_audio=str(media),
+                    out_dir=out_dir,
+                    raw_dir=raw_dir,
+                    log_file=log_file,
+                    asr_cfg=asr_cfg,
+                    translate_cfg=translate_cfg,
+                )
+                return outputs, backends
+            except NetworkWorkflowError as exc:
+                append_log(log_file, f"Online mode network failure attempt {attempt}: {exc}")
+                if attempt == 1:
+                    append_log(log_file, "Retry online mode once because of network failure")
+                    continue
+                append_log(log_file, "Switching to local mode after online network failure")
+                break
+        local_backends = RuntimeBackends(asr_mode="local", translate_mode="local")
+        outputs = generate_subtitles_local(
+            root=root,
+            requested_audio=str(media),
+            model_size=model_size,
+            model_dir=model_dir,
+            out_dir=out_dir,
+            raw_dir=raw_dir,
+            log_file=log_file,
+        )
+        return outputs, local_backends
+
+    outputs = generate_subtitles_local(
+        root=root,
+        requested_audio=str(media),
+        model_size=model_size,
+        model_dir=model_dir,
+        out_dir=out_dir,
+        raw_dir=raw_dir,
+        log_file=log_file,
+    )
+    return outputs, backends
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Subtitle workflow assistant")
     parser.add_argument("audio", nargs="?", help="Audio file name or path")
     parser.add_argument("--root", default=".", help="Project root directory")
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "online", "local"],
+        default="auto",
+        help="Subtitle backend mode: auto asks at startup, online uses network APIs, local uses whisper",
+    )
     parser.add_argument("--model-size", default="large-v3", help="Whisper model size")
     parser.add_argument("--model-dir", default="models/whisper", help="Local whisper model directory")
+    parser.add_argument(
+        "--online-asr-config",
+        default=DEFAULT_ONLINE_ASR_CONFIG,
+        help="Online ASR config JSON path",
+    )
+    parser.add_argument(
+        "--online-translate-config",
+        default=DEFAULT_ONLINE_TRANSLATE_CONFIG,
+        help="Online translate config JSON path",
+    )
     parser.add_argument("--out-dir", default="output", help="Directory for final subtitle outputs")
     parser.add_argument("--raw-dir", default=".transcripts/raw", help="Directory for raw transcription outputs")
     parser.add_argument("--log-file", default=".transcripts/error.log", help="Error log path")
@@ -1203,6 +2039,23 @@ def main() -> int:
         open_cmd_progress_window(log_file)
 
     try:
+        if args.mode == "auto":
+            selected_mode = choose_runtime_mode_interactive(timeout_seconds=5)
+        elif args.mode == "online":
+            selected_mode = "online"
+        else:
+            selected_mode = "local"
+
+        backends = RuntimeBackends(asr_mode=selected_mode, translate_mode=selected_mode)
+        append_log(log_file, f"Runtime mode selected: {backends.asr_mode}")
+
+        asr_cfg: OnlineASRConfig | None = None
+        translate_cfg: OnlineTranslateConfig | None = None
+        if backends.asr_mode == "online":
+            asr_cfg = load_online_asr_config((root / args.online_asr_config).resolve())
+            translate_cfg = load_online_translate_config((root / args.online_translate_config).resolve())
+            append_log(log_file, "Online ASR/translate config loaded")
+
         queue = resolve_audio_queue(root, args.audio)
         append_log(log_file, f"Queue prepared: {len(queue)} media file(s)")
 
@@ -1210,16 +2063,22 @@ def main() -> int:
         for idx, media in enumerate(queue, start=1):
             append_log(log_file, f"Queue item start [{idx}/{len(queue)}]: {media}")
             try:
-                _ = generate_subtitles(
+                _, backends = run_single_media_with_backends(
                     root=root,
-                    requested_audio=str(media),
+                    media=media,
                     model_size=args.model_size,
                     model_dir=model_dir,
                     out_dir=out_dir,
                     raw_dir=raw_dir,
                     log_file=log_file,
+                    backends=backends,
+                    asr_cfg=asr_cfg,
+                    translate_cfg=translate_cfg,
                 )
-                append_log(log_file, f"Queue item done [{idx}/{len(queue)}]: {media.name}")
+                append_log(
+                    log_file,
+                    f"Queue item done [{idx}/{len(queue)}]: {media.name} | backend={backends.asr_mode}",
+                )
             except WorkflowError as exc:
                 failures.append((media, str(exc)))
                 append_log(log_file, f"Queue item failed [{idx}/{len(queue)}]: {media.name} | {exc}")
