@@ -26,7 +26,7 @@
 https://pan.baidu.com/s/1CSM6VnBOkQfOyrdT6Ab2Uw?pwd=pyix 提取码: pyix 
 默认情况下，程序未读取到模型会自动下载(强烈建议网盘下载)。
 
-# 依赖下载地址
+# 环境依赖下载地址（必需）
 链接: https://pan.baidu.com/s/1QFbLMR-0MtWHuGs00LWN7g 提取码: hdzf 
 
 
