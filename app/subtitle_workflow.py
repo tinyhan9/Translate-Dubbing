@@ -4,6 +4,8 @@ import argparse
 import base64
 import contextlib
 import gc
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -100,6 +102,8 @@ TERM_NORMALIZE_MAP = {
     "胡定你": "houdini",
     "胡迪你": "houdini",
     "hudini": "houdini",
+    "胡经理": "houdini",
+    "胡丁理": "houdini",
     "胡定尼": "houdini",
     "虎迪里": "houdini",
     "针": "帧",
@@ -107,9 +111,49 @@ TERM_NORMALIZE_MAP = {
     "tyler": "tiny",
     "valum": "vellum",
 }
+FORCED_TERM_MAP = {
+    "造波": "噪波",
+}
+TRANSLATION_GLOSSARY_MAP = {
+    "Houdini": "Houdini",
+    "节点": "node",
+    "参数": "parameter",
+    "属性": "attribute",
+    "体积": "volume",
+    "体素": "voxel",
+    "采样": "sample",
+    "重映射": "remap",
+    "约束": "constraint",
+    "碰撞体": "collider",
+    "解算器": "solver",
+    "缓存": "cache",
+    "烘焙": "bake",
+    "贴图": "texture",
+    "法线": "normal",
+    "位移": "displacement",
+    "视口": "viewport",
+    "散射": "scatter",
+    "实例化": "instancing",
+    "打包原语": "packed primitive",
+    "打包": "pack",
+    "程序化": "procedural",
+    "形变": "deform",
+    "拓扑": "topology",
+    "时间偏移": "time shift",
+    "循环": "loop",
+    "随机种子": "seed",
+    "插值": "interpolation",
+    "平滑": "smooth",
+    "噪声": "noise",
+    "衰减": "falloff",
+}
 DEFAULT_ONLINE_ASR_CONFIG = "config/online_asr.json"
 DEFAULT_ONLINE_TRANSLATE_CONFIG = "config/online_translate.json"
 DOUBAO_AUC_API = "https://openspeech.bytedance.com/api/v1/auc"
+XFYUN_ASR_LLM_UPLOAD_URL = "https://office-api-ist-dx.iflyaisol.com/v2/upload"
+XFYUN_ASR_LLM_QUERY_URL = "https://office-api-ist-dx.iflyaisol.com/v2/getResult"
+ALIYUN_FILETRANS_DOMAIN = "filetrans.cn-shanghai.aliyuncs.com"
+ONLINE_ASR_PROVIDERS = ("doubao", "aliyun")
 
 
 @dataclass
@@ -153,6 +197,42 @@ class OnlineASRConfig:
 
 
 @dataclass(frozen=True)
+class XFYunASRConfig:
+    app_id: str
+    api_key: str
+    api_secret: str
+    upload_url: str = XFYUN_ASR_LLM_UPLOAD_URL
+    query_task_url: str = XFYUN_ASR_LLM_QUERY_URL
+    language: str = "cn"
+    poll_interval_seconds: float = 2.0
+    max_wait_seconds: int = 7200
+    request_timeout_seconds: int = 120
+
+
+@dataclass(frozen=True)
+class AliyunASRConfig:
+    appkey: str
+    access_key_id: str = ""
+    access_key_secret: str = ""
+    region_id: str = "cn-shanghai"
+    domain: str = ALIYUN_FILETRANS_DOMAIN
+    version: str = "2018-08-17"
+    upload_enabled: bool = True
+    upload_endpoint: str = "https://catbox.moe/user/api.php"
+    upload_timeout_seconds: int = 180
+    poll_interval_seconds: float = 2.0
+    max_wait_seconds: int = 1800
+    request_timeout_seconds: int = 120
+
+
+@dataclass(frozen=True)
+class OnlineASRConfigs:
+    xfyun: XFYunASRConfig | None
+    aliyun: AliyunASRConfig | None
+    doubao: OnlineASRConfig | None
+
+
+@dataclass(frozen=True)
 class OnlineTranslateConfig:
     api_key: str
     base_url: str
@@ -165,6 +245,7 @@ class OnlineTranslateConfig:
 class RuntimeBackends:
     asr_mode: str
     translate_mode: str
+    online_asr_provider: str | None = None
 
 
 def append_log(log_file: Path, message: str) -> None:
@@ -641,6 +722,31 @@ def normalize_terms(text: str) -> str:
     return normalized
 
 
+def apply_forced_term_mapping(text: str) -> str:
+    mapped = text
+    for src, dst in FORCED_TERM_MAP.items():
+        mapped = mapped.replace(src, dst)
+    return mapped
+
+
+def apply_forced_term_mapping_entries(entries: Sequence[SubtitleEntry]) -> list[SubtitleEntry]:
+    out: list[SubtitleEntry] = []
+    for entry in entries:
+        out.append(
+            SubtitleEntry(
+                index=entry.index,
+                start=entry.start,
+                end=entry.end,
+                text=apply_forced_term_mapping(entry.text),
+            )
+        )
+    return out
+
+
+def apply_forced_term_mapping_lines(lines: Sequence[str]) -> list[str]:
+    return [apply_forced_term_mapping(line) for line in lines]
+
+
 def strip_fillers(text: str) -> str:
     cleaned = text
     for filler in ZH_FILLERS:
@@ -659,6 +765,7 @@ def clean_zh_text(text: str) -> str:
     normalized = re.sub(REMOVE_PUNCT, "", normalized)
     normalized = strip_fillers(normalized)
     normalized = normalize_terms(normalized)
+    normalized = apply_forced_term_mapping(normalized)
     normalized = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9?!§\s]", "", normalized)
     normalized = re.sub(r"\s*§\s*", "§", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
@@ -672,6 +779,7 @@ def clean_en_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
     normalized = strip_fillers(normalized)
     normalized = normalize_terms(normalized)
+    normalized = apply_forced_term_mapping(normalized)
     normalized = re.sub(PAUSE_PUNCT, " ", normalized)
     normalized = re.sub(REMOVE_PUNCT, "", normalized)
     normalized = re.sub(r"[^A-Za-z0-9?!\s\-]", "", normalized)
@@ -706,6 +814,88 @@ def spell_correct_en_text(text: str) -> str:
             continue
         out.append(_apply_case(word, corrected) + suffix)
     return " ".join(out)
+
+
+def _zh_term_exists(zh_text: str, term: str) -> bool:
+    if term == "Houdini":
+        normalized = normalize_terms(zh_text)
+        return bool(re.search(r"\bhoudini\b", normalized, flags=re.IGNORECASE))
+    return term in zh_text
+
+
+def _choose_glossary_target(zh_term: str, en_text: str) -> str:
+    if zh_term == "打包":
+        return "packed" if re.search(r"\bpacked\b", en_text, flags=re.IGNORECASE) else "pack"
+    if zh_term == "形变":
+        return "deformation" if re.search(r"\bdeformation\b", en_text, flags=re.IGNORECASE) else "deform"
+    if zh_term == "平滑":
+        return "smoothing" if re.search(r"\bsmoothing\b", en_text, flags=re.IGNORECASE) else "smooth"
+    if zh_term == "衰减":
+        return "attenuation" if re.search(r"\battenuation\b", en_text, flags=re.IGNORECASE) else "falloff"
+    return TRANSLATION_GLOSSARY_MAP[zh_term]
+
+
+def _replace_en_term_by_zh_context(text: str, zh_term: str, target: str) -> str:
+    patterns_by_term = {
+        "Houdini": [r"\bhudini\b", r"\bhoudini\b"],
+        "节点": [r"\bnodes?\b"],
+        "参数": [r"\bparams?\b", r"\bparameters?\b"],
+        "属性": [r"\battributes?\b", r"\bprops?\b", r"\bproperties\b"],
+        "体积": [r"\bvolumes?\b", r"\bvolumetric\b"],
+        "体素": [r"\bvoxels?\b"],
+        "采样": [r"\bsamples?\b", r"\bsampling\b"],
+        "重映射": [r"\bremap(?:ping)?\b", r"\bre-map(?:ping)?\b"],
+        "约束": [r"\bconstraints?\b"],
+        "碰撞体": [r"\bcolliders?\b", r"\bcollision\s+(?:body|mesh|object)s?\b"],
+        "解算器": [r"\bsolvers?\b"],
+        "缓存": [r"\bcaches?\b", r"\bcaching\b"],
+        "烘焙": [r"\bbakes?\b", r"\bbaking\b"],
+        "贴图": [r"\btextures?\b", r"\btexturing\b"],
+        "法线": [r"\bnormals?\b"],
+        "位移": [r"\bdisplacements?\b"],
+        "视口": [r"\bviewports?\b"],
+        "散射": [r"\bscatters?\b", r"\bscattering\b"],
+        "实例化": [r"\binstancing\b", r"\binstances?\b"],
+        "打包原语": [r"\bpacked\s+primitives?\b"],
+        "打包": [r"\bpacks?\b", r"\bpacked\b", r"\bpacking\b"],
+        "程序化": [r"\bprocedural(?:ly)?\b"],
+        "形变": [r"\bdeforms?\b", r"\bdeforming\b", r"\bdeformations?\b"],
+        "拓扑": [r"\btopolog(?:y|ies)\b"],
+        "时间偏移": [r"\btime\s*shift\b", r"\btime\s*offset\b"],
+        "循环": [r"\bloops?\b", r"\blooping\b"],
+        "随机种子": [r"\brandom\s+seed\b", r"\bseeds?\b"],
+        "插值": [r"\binterpolations?\b", r"\binterpolate(?:d|s|ing)?\b"],
+        "平滑": [r"\bsmooth(?:ed|ing)?\b", r"\bsmoothing\b"],
+        "噪声": [r"\bnoise\b", r"\bnoises\b"],
+        "衰减": [r"\bfalloff\b", r"\battenuation\b"],
+    }
+
+    out = text
+    replaced = False
+    for pattern in patterns_by_term.get(zh_term, []):
+        if re.search(pattern, out, flags=re.IGNORECASE):
+            out = re.sub(pattern, target, out, flags=re.IGNORECASE)
+            replaced = True
+
+    if not replaced:
+        if zh_term == "Houdini":
+            out = re.sub(r"\bhoudini\b", target, out, flags=re.IGNORECASE)
+        else:
+            out = out.replace(zh_term, target)
+    return out
+
+
+def apply_translation_glossary(zh_text: str, en_text: str) -> str:
+    if not en_text:
+        return en_text
+    out = en_text
+    ordered_terms = sorted(TRANSLATION_GLOSSARY_MAP.keys(), key=len, reverse=True)
+    for zh_term in ordered_terms:
+        if not _zh_term_exists(zh_text, zh_term):
+            continue
+        target = _choose_glossary_target(zh_term, out)
+        out = _replace_en_term_by_zh_context(out, zh_term, target)
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def compress_en_for_timing(text: str, max_chars: int) -> str:
@@ -944,7 +1134,9 @@ def align_english_to_zh(zh_entries: Sequence[SubtitleEntry], en_segments: Sequen
             # Keep English concise so speaking rhythm can better fit the source timeline.
             en_char_budget = max(28, min(72, int(duration * 20)))
             text_piece = pieces[k] if k < len(pieces) else seg_text
-            merged = compress_en_for_timing(text_piece, max_chars=en_char_budget)
+            merged = apply_translation_glossary(zh.text, text_piece)
+            merged = compress_en_for_timing(merged, max_chars=en_char_budget)
+            merged = apply_translation_glossary(zh.text, merged)
             lines.append(merged)
         i = j
 
@@ -1114,19 +1306,27 @@ def write_backend_report(
     *,
     asr_mode: str,
     translate_mode: str,
+    asr_detail: str,
+    translate_detail: str,
+    fallback_detail: str | None = None,
 ) -> Path:
     media_out_dir.mkdir(parents=True, exist_ok=True)
-    asr_label = "在线识别" if asr_mode == "online" else "本地识别"
-    translate_label = "在线翻译" if translate_mode == "online" else "本地翻译"
+    asr_label = "在线识别" if asr_mode.startswith("online") else "本地识别"
+    translate_label = "在线翻译" if translate_mode.startswith("online") else "本地翻译"
+    asr_detail_clean = re.sub(r"\s*[\(（].*$", "", asr_detail).strip()
+    translate_detail_clean = re.sub(r"\s*[\(（].*$", "", translate_detail).strip()
     report_path = media_out_dir / f"{base_name}.backend.txt"
-    content = "\n".join(
-        [
-            "字幕流程方式说明",
-            f"字幕识别最终方式: {asr_label}",
-            f"字幕翻译最终方式: {translate_label}",
-            "",
-        ]
-    )
+    lines = [
+        "字幕流程方式说明",
+        f"字幕识别最终方式: {asr_label} ({asr_mode})",
+        f"字幕识别详细: {asr_detail_clean}",
+        f"字幕翻译最终方式: {translate_label} ({translate_mode})",
+        f"字幕翻译详细: {translate_detail_clean}",
+    ]
+    if fallback_detail:
+        lines.append(f"回退说明: {fallback_detail}")
+    lines.append("")
+    content = "\n".join(lines)
     report_path.write_text(content, encoding="utf-8", newline="\n")
     return report_path
 
@@ -1143,12 +1343,7 @@ def read_json_config(config_path: Path) -> dict:
     return raw
 
 
-def load_online_asr_config(config_path: Path) -> OnlineASRConfig:
-    raw = read_json_config(config_path)
-    cfg = raw.get("doubao_asr", raw)
-    if not isinstance(cfg, dict):
-        raise WorkflowError(f"Invalid doubao_asr config object: {config_path}")
-
+def _load_doubao_asr_config_from_dict(cfg: dict, config_path: Path) -> OnlineASRConfig:
     def _need(key: str) -> str:
         value = str(cfg.get(key, "")).strip()
         if not value:
@@ -1192,6 +1387,72 @@ def load_online_asr_config(config_path: Path) -> OnlineASRConfig:
     )
 
 
+def _load_xfyun_asr_config_from_dict(cfg: dict, config_path: Path) -> XFYunASRConfig:
+    def _need(key: str) -> str:
+        value = str(cfg.get(key, "")).strip()
+        if not value:
+            raise WorkflowError(f"Missing required xfyun ASR config key: {key} ({config_path})")
+        return value
+
+    return XFYunASRConfig(
+        app_id=_need("app_id"),
+        api_key=_need("api_key"),
+        api_secret=_need("api_secret"),
+        upload_url=str(cfg.get("upload_url", XFYUN_ASR_LLM_UPLOAD_URL)).strip() or XFYUN_ASR_LLM_UPLOAD_URL,
+        query_task_url=str(cfg.get("query_task_url", XFYUN_ASR_LLM_QUERY_URL)).strip() or XFYUN_ASR_LLM_QUERY_URL,
+        language=str(cfg.get("language", "cn")).strip() or "cn",
+        poll_interval_seconds=max(float(cfg.get("poll_interval_seconds", 2.0)), 0.2),
+        max_wait_seconds=max(int(cfg.get("max_wait_seconds", 7200)), 30),
+        request_timeout_seconds=max(int(cfg.get("request_timeout_seconds", 120)), 10),
+    )
+
+
+def _load_aliyun_asr_config_from_dict(cfg: dict, config_path: Path) -> AliyunASRConfig:
+    appkey = str(cfg.get("appkey", "")).strip()
+    if not appkey:
+        raise WorkflowError(f"Missing required aliyun ASR config key: appkey ({config_path})")
+    return AliyunASRConfig(
+        appkey=appkey,
+        access_key_id=str(cfg.get("access_key_id", "")).strip(),
+        access_key_secret=str(cfg.get("access_key_secret", "")).strip(),
+        region_id=str(cfg.get("region_id", "cn-shanghai")).strip() or "cn-shanghai",
+        domain=str(cfg.get("domain", ALIYUN_FILETRANS_DOMAIN)).strip() or ALIYUN_FILETRANS_DOMAIN,
+        version=str(cfg.get("version", "2018-08-17")).strip() or "2018-08-17",
+        upload_enabled=bool(cfg.get("upload_enabled", True)),
+        upload_endpoint=str(cfg.get("upload_endpoint", "https://catbox.moe/user/api.php")).strip()
+        or "https://catbox.moe/user/api.php",
+        upload_timeout_seconds=max(int(cfg.get("upload_timeout_seconds", 180)), 10),
+        poll_interval_seconds=max(float(cfg.get("poll_interval_seconds", 2.0)), 0.2),
+        max_wait_seconds=max(int(cfg.get("max_wait_seconds", 1800)), 30),
+        request_timeout_seconds=max(int(cfg.get("request_timeout_seconds", 120)), 10),
+    )
+
+
+def load_online_asr_configs(config_path: Path) -> OnlineASRConfigs:
+    raw = read_json_config(config_path)
+
+    doubao_raw = raw.get("doubao_asr")
+    if doubao_raw is None and {"app_id", "access_token", "secret_key"}.issubset(set(raw.keys())):
+        doubao_raw = raw
+    if doubao_raw is not None and not isinstance(doubao_raw, dict):
+        raise WorkflowError(f"Invalid doubao_asr config object: {config_path}")
+    doubao_cfg = _load_doubao_asr_config_from_dict(doubao_raw, config_path) if isinstance(doubao_raw, dict) else None
+
+    xfyun_raw = raw.get("xfyun_asr", raw.get("xunfei_asr"))
+    if xfyun_raw is not None and not isinstance(xfyun_raw, dict):
+        raise WorkflowError(f"Invalid xfyun_asr config object: {config_path}")
+    xfyun_cfg = _load_xfyun_asr_config_from_dict(xfyun_raw, config_path) if isinstance(xfyun_raw, dict) else None
+
+    aliyun_raw = raw.get("aliyun_asr")
+    if aliyun_raw is not None and not isinstance(aliyun_raw, dict):
+        raise WorkflowError(f"Invalid aliyun_asr config object: {config_path}")
+    aliyun_cfg = _load_aliyun_asr_config_from_dict(aliyun_raw, config_path) if isinstance(aliyun_raw, dict) else None
+
+    if xfyun_cfg is None and aliyun_cfg is None and doubao_cfg is None:
+        raise WorkflowError(f"No usable online ASR config found in: {config_path}")
+    return OnlineASRConfigs(xfyun=xfyun_cfg, aliyun=aliyun_cfg, doubao=doubao_cfg)
+
+
 def load_online_translate_config(config_path: Path) -> OnlineTranslateConfig:
     raw = read_json_config(config_path)
     cfg = raw.get("rightcode_translate", raw)
@@ -1215,7 +1476,41 @@ def load_online_translate_config(config_path: Path) -> OnlineTranslateConfig:
 
 def choose_runtime_mode_interactive(timeout_seconds: int = 5) -> str:
     print(
-        "请选择识别方式：1=在线大模型识别+翻译，2=本地模型识别。"
+        "请选择识别方式：1=本地模型识别，2=在线大模型识别+翻译。"
+        f"{timeout_seconds}秒内不输入将默认选择1（本地识别）。",
+        flush=True,
+    )
+    print("请输入 1 或 2: ", end="", flush=True)
+
+    answer_q: queue.Queue[str] = queue.Queue(maxsize=1)
+
+    def _read_input() -> None:
+        try:
+            value = input().strip()
+        except EOFError:
+            return
+        if value not in {"1", "2"}:
+            return
+        try:
+            answer_q.put_nowait(value)
+        except queue.Full:
+            pass
+
+    worker = threading.Thread(target=_read_input, daemon=True)
+    worker.start()
+
+    try:
+        value = answer_q.get(timeout=timeout_seconds).strip()
+    except queue.Empty:
+        print("", flush=True)
+        return "local"
+
+    return "online" if value == "2" else "local"
+
+
+def choose_online_asr_provider_interactive(timeout_seconds: int = 5) -> str:
+    print(
+        "请选择在线语音识别引擎：1=豆包在线识别，2=阿里云录音文件识别。"
         f"{timeout_seconds}秒内不输入将默认选择1。",
         flush=True,
     )
@@ -1242,9 +1537,11 @@ def choose_runtime_mode_interactive(timeout_seconds: int = 5) -> str:
         value = answer_q.get(timeout=timeout_seconds).strip()
     except queue.Empty:
         print("", flush=True)
-        return "online"
+        return "doubao"
 
-    return "local" if value == "2" else "online"
+    if value == "2":
+        return "aliyun"
+    return "doubao"
 
 
 def _is_network_exception(exc: BaseException) -> bool:
@@ -1298,9 +1595,57 @@ def _upload_audio_to_temp_url(audio_file: Path, cfg: OnlineASRConfig, log_file: 
     if not cfg.upload_enabled:
         raise WorkflowError("Online ASR upload is disabled in config; cannot build publicly reachable audio URL")
 
-    quoted_name = urlparse.quote(audio_file.name)
-    target = f"{cfg.upload_endpoint.rstrip('/')}/{quoted_name}"
     append_log(log_file, f"Online ASR upload start: {audio_file.name}")
+    endpoint = cfg.upload_endpoint.strip()
+    endpoint_lower = endpoint.lower()
+    if "catbox.moe/user/api.php" in endpoint_lower:
+        curl_bin = shutil.which("curl")
+        if curl_bin:
+            cmd = [
+                curl_bin,
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                str(cfg.upload_timeout_seconds),
+                "-F",
+                "reqtype=fileupload",
+                "-F",
+                f"fileToUpload=@{str(audio_file)}",
+                endpoint,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                uploaded = proc.stdout.strip()
+                if uploaded.startswith("http://") or uploaded.startswith("https://"):
+                    append_log(log_file, f"Online ASR upload done: {uploaded}")
+                    return uploaded
+
+        try:
+            data = audio_file.read_bytes()
+        except Exception as exc:
+            raise WorkflowError(f"Failed to read audio for upload: {audio_file} | {exc}") from exc
+        body, content_type = _build_multipart_form_data(
+            fields={"reqtype": "fileupload"},
+            file_field=("fileToUpload", audio_file.name, data, "application/octet-stream"),
+        )
+        req = urlrequest.Request(url=endpoint, data=body, method="POST")
+        req.add_header("Content-Type", content_type)
+        try:
+            with urlrequest.urlopen(req, timeout=cfg.upload_timeout_seconds) as resp:
+                uploaded = resp.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            if _is_network_exception(exc):
+                raise NetworkWorkflowError(f"Failed to upload audio for online ASR: {exc}") from exc
+            raise WorkflowError(f"Failed to upload audio for online ASR: {exc}") from exc
+
+        if not (uploaded.startswith("http://") or uploaded.startswith("https://")):
+            raise WorkflowError(f"Upload endpoint did not return URL: {uploaded[:200]}")
+        append_log(log_file, f"Online ASR upload done: {uploaded}")
+        return uploaded
+
+    quoted_name = urlparse.quote(audio_file.name)
+    target = f"{endpoint.rstrip('/')}/{quoted_name}"
 
     curl_bin = shutil.which("curl")
     if curl_bin:
@@ -1552,15 +1897,17 @@ def run_doubao_asr_with_retry(
     cfg: OnlineASRConfig,
     log_file: Path,
 ) -> dict:
+    source_audio_file = audio_file.resolve()
+    append_log(log_file, f"Doubao source audio: {source_audio_file.name}")
     last_error: Exception | None = None
     for attempt in (1, 2):
         try:
             append_log(log_file, f"transcribe started (attempt {attempt})")
             append_log(log_file, "transcribe progress: 0.0%")
             if cfg.api_version == "v1_submit_query":
-                result = _run_doubao_v1_submit_query_once(audio_file, cfg, log_file)
+                result = _run_doubao_v1_submit_query_once(source_audio_file, cfg, log_file)
             else:
-                result = _run_doubao_v3_flash_once(audio_file, cfg, log_file)
+                result = _run_doubao_v3_flash_once(source_audio_file, cfg, log_file)
             append_log(log_file, "transcribe progress: 100.0%")
             return result
         except Exception as exc:
@@ -1572,6 +1919,695 @@ def run_doubao_asr_with_retry(
                 raise WorkflowError(f"Doubao ASR failed after retry: {exc}") from exc
     assert last_error is not None
     raise WorkflowError(f"Doubao ASR failed: {last_error}")
+
+
+def _build_segments_from_text(full_text: str, total_seconds: float) -> list[dict]:
+    cleaned = full_text.strip()
+    if not cleaned:
+        return []
+    chunks = [part.strip() for part in re.split(r"[。！？!?；;]+", cleaned) if part.strip()]
+    if not chunks:
+        chunks = [cleaned]
+    total_seconds = max(total_seconds, 0.4 * len(chunks))
+    total_weight = sum(max(len(c), 1) for c in chunks)
+    cursor = 0.0
+    segments: list[dict] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        weight = max(len(chunk), 1)
+        duration = max(0.3, total_seconds * (weight / total_weight))
+        start = cursor
+        end = min(total_seconds, cursor + duration)
+        if end <= start:
+            end = start + 0.4
+        cursor = end
+        segments.append({"id": idx, "start": start, "end": end, "text": chunk})
+    return segments
+
+
+def _prepare_audio_for_xfyun_upload(audio_file: Path, log_file: Path) -> tuple[Path, float]:
+    resolved = audio_file.resolve()
+    duration = probe_duration_seconds(resolved)
+    append_log(log_file, f"XFYun upload source audio: {resolved.name}")
+    return resolved, duration
+
+
+def _prepare_audio_for_aliyun_upload(audio_file: Path, log_file: Path) -> tuple[Path, float]:
+    resolved = audio_file.resolve()
+    duration = probe_duration_seconds(resolved)
+    append_log(log_file, f"Aliyun upload source audio: {resolved.name}")
+    return resolved, duration
+
+
+def _infer_xfyun_audio_meta(audio_file: Path) -> tuple[str, str]:
+    ext = audio_file.suffix.lower()
+    mapping = {
+        ".mp3": ("audio/mpeg", "lame"),
+        ".wav": ("audio/wav", "raw"),
+        ".m4a": ("audio/mp4", "aac"),
+        ".aac": ("audio/aac", "aac"),
+        ".flac": ("audio/flac", "flac"),
+        ".ogg": ("audio/ogg", "ogg"),
+    }
+    return mapping.get(ext, ("application/octet-stream", "raw"))
+
+
+def _build_multipart_form_data(
+    *,
+    fields: dict[str, str],
+    file_field: tuple[str, str, bytes, str],
+) -> tuple[bytes, str]:
+    boundary = f"----CodexBoundary{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(str(value).encode("utf-8"))
+        chunks.append(b"\r\n")
+
+    field_name, filename, content, content_type = file_field
+    chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+    chunks.append(
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode("utf-8")
+    )
+    chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+    chunks.append(content)
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(chunks)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def _build_xfyun_asrllm_signature(*, api_secret: str, params: dict[str, object]) -> str:
+    filtered: list[tuple[str, str]] = []
+    for key, value in params.items():
+        key_text = str(key)
+        if key_text == "signature":
+            continue
+        if value is None:
+            continue
+        value_text = str(value).strip()
+        if not value_text:
+            continue
+        filtered.append((key_text, value_text))
+    filtered.sort(key=lambda item: item[0])
+    canonical = "&".join(f"{k}={urlparse.quote_plus(v, safe='')}" for k, v in filtered)
+    digest = hmac.new(api_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _append_query_params(url: str, params: dict[str, object]) -> str:
+    parsed = urlparse.urlsplit(url)
+    merged = dict(urlparse.parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        merged[str(key)] = str(value)
+    query = urlparse.urlencode(merged)
+    return urlparse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _build_xfyun_asrllm_request_meta(*, signature_random: str | None = None) -> tuple[str, str]:
+    date_time = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    random_token = (signature_random or "").strip() or uuid.uuid4().hex[:16]
+    return date_time, random_token
+
+
+def _xfyun_asrllm_post(
+    *,
+    url: str,
+    body: bytes,
+    content_type: str,
+    timeout_seconds: int,
+    extra_headers: dict[str, str] | None = None,
+) -> dict:
+    headers = {"Content-Type": content_type, "Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urlrequest.Request(url=url, data=body, headers=headers, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code >= 500:
+            raise NetworkWorkflowError(f"xfyun asr-llm ASR HTTP {exc.code}: {detail}") from exc
+        raise WorkflowError(f"xfyun asr-llm ASR HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        if _is_network_exception(exc):
+            raise NetworkWorkflowError(f"xfyun asr-llm ASR network error: {exc}") from exc
+        raise WorkflowError(f"xfyun asr-llm ASR request failed: {exc}") from exc
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise WorkflowError(f"xfyun asr-llm ASR invalid JSON response: {raw[:400]}") from exc
+    if not isinstance(parsed, dict):
+        raise WorkflowError(f"xfyun asr-llm ASR invalid response object: {raw[:400]}")
+    return parsed
+
+
+def _xfyun_ifasr_assert_success(raw: dict, stage: str) -> dict:
+    code_raw = str(raw.get("code", "")).strip()
+    if code_raw != "000000":
+        raise WorkflowError(
+            f"xfyun asr-llm ASR {stage} failed: code={code_raw}, message={raw.get('message')}, raw={raw}"
+        )
+    content = raw.get("content", {})
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except Exception:
+            content = {}
+    return content if isinstance(content, dict) else {}
+
+
+def _xfyun_to_seconds_from_ms(raw: object) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return max(float(raw) / 1000.0, 0.0)
+    except Exception:
+        return None
+
+
+def _xfyun_extract_text_from_st(st: dict) -> str:
+    rt_items = st.get("rt")
+    if not isinstance(rt_items, list):
+        return str(st.get("onebest", "")).strip()
+    parts: list[str] = []
+    for rt in rt_items:
+        if not isinstance(rt, dict):
+            continue
+        ws_items = rt.get("ws")
+        if not isinstance(ws_items, list):
+            continue
+        for ws in ws_items:
+            if not isinstance(ws, dict):
+                continue
+            cw_items = ws.get("cw")
+            if not isinstance(cw_items, list) or not cw_items:
+                continue
+            first = cw_items[0] if isinstance(cw_items[0], dict) else {}
+            word = str(first.get("w", ""))
+            if word:
+                parts.append(word)
+    return "".join(parts).strip()
+
+
+def _xfyun_parse_speed_result(result_raw: object) -> tuple[list[dict], str]:
+    if isinstance(result_raw, dict):
+        result = result_raw
+    elif isinstance(result_raw, str):
+        text = result_raw.strip()
+        if not text:
+            return [], ""
+        try:
+            result = json.loads(text)
+        except Exception as exc:
+            raise WorkflowError(f"xfyun asr-llm ASR result is not valid JSON: {text[:300]}") from exc
+    else:
+        return [], ""
+
+    if not isinstance(result, dict):
+        return [], ""
+
+    segments: list[dict] = []
+    full_parts: list[str] = []
+    lattice = result.get("lattice", [])
+    if not isinstance(lattice, list):
+        lattice = []
+    for item in lattice:
+        if not isinstance(item, dict):
+            continue
+        one_best = item.get("json_1best")
+        if isinstance(one_best, str):
+            try:
+                one_best = json.loads(one_best)
+            except Exception:
+                continue
+        if not isinstance(one_best, dict):
+            continue
+        st = one_best.get("st", one_best)
+        if not isinstance(st, dict):
+            continue
+        text = _xfyun_extract_text_from_st(st)
+        if not text:
+            continue
+        start = _xfyun_to_seconds_from_ms(st.get("bg"))
+        end = _xfyun_to_seconds_from_ms(st.get("ed"))
+        if start is None:
+            start = segments[-1]["end"] if segments else 0.0
+        if end is None or end <= start:
+            end = start + max(0.3, len(text) * 0.08)
+        full_parts.append(text)
+        segments.append({"id": len(segments) + 1, "start": start, "end": end, "text": text})
+
+    if not segments:
+        detail = result.get("detail", [])
+        if not isinstance(detail, list):
+            detail = []
+        for item in detail:
+            if not isinstance(item, dict):
+                continue
+            utterances = item.get("speaker_utterances", [])
+            text_parts: list[str] = []
+            if isinstance(utterances, list):
+                for utter in utterances:
+                    if not isinstance(utter, dict):
+                        continue
+                    one = str(utter.get("text", utter.get("onebest", utter.get("content", "")))).strip()
+                    if one:
+                        text_parts.append(one)
+            text = " ".join(text_parts).strip() or str(item.get("text", "")).strip()
+            if not text:
+                continue
+            start = _xfyun_to_seconds_from_ms(item.get("sg_start_time", item.get("start_time")))
+            end = _xfyun_to_seconds_from_ms(item.get("sg_end_time", item.get("end_time")))
+            if start is None:
+                start = segments[-1]["end"] if segments else 0.0
+            if end is None or end <= start:
+                end = start + max(0.3, len(text) * 0.08)
+            full_parts.append(text)
+            segments.append({"id": len(segments) + 1, "start": start, "end": end, "text": text})
+
+    full_text = "".join(full_parts).strip()
+    if not full_text:
+        full_text = str(result.get("text", "")).strip()
+    return segments, full_text
+
+
+def _build_transcribe_result_from_xfyun(content: dict, audio_duration_seconds: float) -> dict:
+    result_raw = content.get("orderResult", content.get("result", ""))
+    segments, full_text = _xfyun_parse_speed_result(result_raw)
+    if not segments and full_text:
+        segments = _build_segments_from_text(full_text, audio_duration_seconds)
+    return {
+        "text": full_text,
+        "segments": segments,
+        "raw_query": {"engine": "xfyun_asr_llm_transcription", "content": content},
+    }
+
+
+def _run_xfyun_asr_once(audio_file: Path, cfg: XFYunASRConfig, log_file: Path) -> dict:
+    append_log(log_file, "transcribe progress: 6.0%")
+    upload_audio_file, audio_duration_seconds = _prepare_audio_for_xfyun_upload(audio_file, log_file)
+    try:
+        upload_bytes = upload_audio_file.read_bytes()
+    except Exception as exc:
+        raise WorkflowError(f"Failed to read source audio for xfyun ASR: {upload_audio_file} | {exc}") from exc
+
+    if not upload_bytes:
+        raise WorkflowError(f"xfyun ASR source audio is empty: {upload_audio_file}")
+
+    upload_date_time, signature_random = _build_xfyun_asrllm_request_meta()
+    upload_params: dict[str, object] = {
+        "appId": cfg.app_id,
+        "accessKeyId": cfg.api_key,
+        "dateTime": upload_date_time,
+        "signatureRandom": signature_random,
+        "fileSize": len(upload_bytes),
+        "fileName": upload_audio_file.name,
+        "duration": max(int(round(audio_duration_seconds * 1000.0)), 1),
+        "language": cfg.language,
+    }
+    upload_signature = _build_xfyun_asrllm_signature(api_secret=cfg.api_secret, params=upload_params)
+    upload_url = _append_query_params(
+        cfg.upload_url,
+        upload_params,
+    )
+    upload_resp = _xfyun_asrllm_post(
+        url=upload_url,
+        body=upload_bytes,
+        content_type="application/octet-stream",
+        timeout_seconds=cfg.request_timeout_seconds,
+        extra_headers={"signature": upload_signature},
+    )
+    upload_content = _xfyun_ifasr_assert_success(upload_resp, "upload")
+    order_id = str(upload_content.get("orderId", "")).strip()
+    if not order_id:
+        raise WorkflowError(f"xfyun asr-llm ASR upload returned empty orderId: {upload_resp}")
+    append_log(log_file, "transcribe progress: 18.0%")
+
+    append_log(log_file, "transcribe progress: 28.0%")
+
+    started = time.monotonic()
+    last_bucket = -1
+    while True:
+        query_date_time, _ = _build_xfyun_asrllm_request_meta(signature_random=signature_random)
+        query_params: dict[str, object] = {
+            "accessKeyId": cfg.api_key,
+            "dateTime": query_date_time,
+            "signatureRandom": signature_random,
+            "orderId": order_id,
+            "resultType": "transfer",
+        }
+        query_signature = _build_xfyun_asrllm_signature(api_secret=cfg.api_secret, params=query_params)
+        query_url = _append_query_params(
+            cfg.query_task_url,
+            query_params,
+        )
+        query_resp = _xfyun_asrllm_post(
+            url=query_url,
+            body=b"{}",
+            content_type="application/json",
+            timeout_seconds=cfg.request_timeout_seconds,
+            extra_headers={"signature": query_signature},
+        )
+        code_raw = str(query_resp.get("code", "")).strip()
+        if code_raw in {"100013", "26605"}:
+            status = 3
+            query_content: dict = {}
+        else:
+            query_content = _xfyun_ifasr_assert_success(query_resp, "query_task")
+            order_info = query_content.get("orderInfo", {})
+            if not isinstance(order_info, dict):
+                order_info = {}
+            fail_type_raw = order_info.get("failType", 0)
+            try:
+                fail_type = int(fail_type_raw)
+            except Exception:
+                fail_type = 0
+            if fail_type > 0:
+                raise WorkflowError(f"xfyun asr-llm ASR task failed: {query_content}")
+            status_raw = order_info.get("status", query_content.get("status", -1))
+            try:
+                status = int(status_raw)
+            except Exception:
+                status = -1
+
+        if status == 4 or ("orderResult" in query_content and status < 0):
+            append_log(log_file, "transcribe progress: 98.0%")
+            return _build_transcribe_result_from_xfyun(query_content, audio_duration_seconds)
+        if status < 0 and code_raw != "26605":
+            raise WorkflowError(f"xfyun asr-llm ASR task failed: {query_resp}")
+
+        elapsed = time.monotonic() - started
+        if elapsed > cfg.max_wait_seconds:
+            raise NetworkWorkflowError("xfyun asr-llm ASR query timed out")
+        pct = min(96.0, 28.0 + (elapsed / cfg.max_wait_seconds) * 68.0)
+        bucket = int(pct // 2)
+        if bucket > last_bucket:
+            last_bucket = bucket
+            append_log(log_file, f"transcribe progress: {pct:.1f}%")
+        time.sleep(cfg.poll_interval_seconds)
+
+
+def run_xfyun_asr_with_retry(
+    *,
+    audio_file: Path,
+    cfg: XFYunASRConfig,
+    log_file: Path,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            append_log(log_file, f"transcribe started xfyun-asr-llm (attempt {attempt})")
+            append_log(log_file, "transcribe progress: 0.0%")
+            result = _run_xfyun_asr_once(audio_file, cfg, log_file)
+            append_log(log_file, "transcribe progress: 100.0%")
+            return result
+        except Exception as exc:
+            last_error = exc
+            append_log(log_file, f"xfyun transcribe attempt {attempt} failed: {exc}")
+            if attempt == 2:
+                if _is_network_exception(exc):
+                    raise NetworkWorkflowError(f"xfyun ASR failed after retry: {exc}") from exc
+                raise WorkflowError(f"xfyun ASR failed after retry: {exc}") from exc
+    assert last_error is not None
+    raise WorkflowError(f"xfyun ASR failed: {last_error}")
+
+
+def _ensure_aliyun_sdk():
+    try:
+        from aliyunsdkcore.client import AcsClient  # type: ignore
+        from aliyunsdkcore.request import CommonRequest  # type: ignore
+
+        return AcsClient, CommonRequest
+    except Exception:
+        pass
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--quiet",
+        "aliyun-python-sdk-core",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise NetworkWorkflowError(f"Failed to install aliyun sdk core: {detail}")
+
+    try:
+        from aliyunsdkcore.client import AcsClient  # type: ignore
+        from aliyunsdkcore.request import CommonRequest  # type: ignore
+
+        return AcsClient, CommonRequest
+    except Exception as exc:
+        raise WorkflowError(f"aliyun sdk install succeeded but import failed: {exc}") from exc
+
+
+def _resolve_aliyun_credentials(cfg: AliyunASRConfig) -> tuple[str, str]:
+    access_key_id = (
+        cfg.access_key_id
+        or str(os.environ.get("ALIYUN_AK_ID", "")).strip()
+        or str(os.environ.get("ALIYUN_ACCESS_KEY_ID", "")).strip()
+    )
+    access_key_secret = (
+        cfg.access_key_secret
+        or str(os.environ.get("ALIYUN_AK_SECRET", "")).strip()
+        or str(os.environ.get("ALIYUN_ACCESS_KEY_SECRET", "")).strip()
+    )
+    # Tolerate common copy/paste trailing punctuation from chat text.
+    access_key_id = access_key_id.strip().strip("。.;,")
+    access_key_secret = access_key_secret.strip().strip("。.;,")
+    if not access_key_id or not access_key_secret:
+        raise WorkflowError(
+            "Aliyun ASR requires access_key_id/access_key_secret in config or env "
+            "(ALIYUN_AK_ID/ALIYUN_AK_SECRET)"
+        )
+    return access_key_id, access_key_secret
+
+
+def _build_transcribe_result_from_aliyun_result(result_raw: object, audio_duration_seconds: float) -> dict:
+    parsed: dict
+    if isinstance(result_raw, dict):
+        parsed = result_raw
+    elif isinstance(result_raw, str):
+        text = result_raw.strip()
+        if not text:
+            parsed = {}
+        else:
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                decoded = {}
+            parsed = decoded if isinstance(decoded, dict) else {}
+    else:
+        parsed = {}
+
+    sentences = parsed.get("Sentences", parsed.get("sentences", []))
+    if not isinstance(sentences, list):
+        sentences = []
+
+    segments: list[dict] = []
+    full_parts: list[str] = []
+    for item in sentences:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("Text", item.get("text", ""))).strip()
+        if not text:
+            continue
+        begin_ms = item.get("BeginTime", item.get("begin_time", item.get("start_time", 0)))
+        end_ms = item.get("EndTime", item.get("end_time", item.get("stop_time", begin_ms)))
+        try:
+            start = max(float(begin_ms) / 1000.0, 0.0)
+        except Exception:
+            start = segments[-1]["end"] if segments else 0.0
+        try:
+            end = max(float(end_ms) / 1000.0, start + 0.2)
+        except Exception:
+            end = start + max(0.3, len(text) * 0.08)
+
+        full_parts.append(text)
+        segments.append({"id": len(segments) + 1, "start": start, "end": end, "text": text})
+
+    full_text = " ".join(full_parts).strip()
+    if not segments and full_text:
+        segments = _build_segments_from_text(full_text, audio_duration_seconds)
+    return {"text": full_text, "segments": segments, "raw_query": {"engine": "aliyun_filetrans", "result": parsed}}
+
+
+def _run_aliyun_asr_once(audio_file: Path, cfg: AliyunASRConfig, log_file: Path) -> dict:
+    AcsClient, CommonRequest = _ensure_aliyun_sdk()
+    access_key_id, access_key_secret = _resolve_aliyun_credentials(cfg)
+    upload_audio_file, duration = _prepare_audio_for_aliyun_upload(audio_file, log_file)
+    audio_url = _upload_audio_to_temp_url(upload_audio_file, cfg, log_file)
+    append_log(log_file, "transcribe progress: 18.0%")
+
+    client = AcsClient(access_key_id, access_key_secret, cfg.region_id)
+    task = {
+        "appkey": cfg.appkey,
+        "file_link": audio_url,
+        "version": "4.0",
+        "enable_words": False,
+        "enable_timestamp_alignment": True,
+    }
+
+    submit = CommonRequest()
+    submit.set_accept_format("json")
+    submit.set_domain(cfg.domain)
+    submit.set_version(cfg.version)
+    submit.set_method("POST")
+    submit.set_action_name("SubmitTask")
+    submit.add_body_params("Task", json.dumps(task, ensure_ascii=False))
+    try:
+        submit_raw = client.do_action_with_exception(submit)
+    except Exception as exc:
+        if _is_network_exception(exc):
+            raise NetworkWorkflowError(f"Aliyun SubmitTask network error: {exc}") from exc
+        raise WorkflowError(f"Aliyun SubmitTask failed: {exc}") from exc
+
+    try:
+        submit_resp = json.loads(submit_raw.decode("utf-8", errors="replace"))
+    except Exception as exc:
+        raise WorkflowError("Aliyun SubmitTask returned invalid JSON") from exc
+    if not isinstance(submit_resp, dict):
+        raise WorkflowError("Aliyun SubmitTask returned invalid response object")
+
+    status_text = str(submit_resp.get("StatusText", "")).upper()
+    if status_text != "SUCCESS":
+        raise WorkflowError(f"Aliyun SubmitTask failed: {submit_resp}")
+    task_id = str(submit_resp.get("TaskId", "")).strip()
+    if not task_id:
+        raise WorkflowError(f"Aliyun SubmitTask returned empty TaskId: {submit_resp}")
+    append_log(log_file, "transcribe progress: 28.0%")
+
+    started = time.monotonic()
+    last_bucket = -1
+    while True:
+        query = CommonRequest()
+        query.set_accept_format("json")
+        query.set_domain(cfg.domain)
+        query.set_version(cfg.version)
+        query.set_method("GET")
+        query.set_action_name("GetTaskResult")
+        query.add_query_param("TaskId", task_id)
+        try:
+            query_raw = client.do_action_with_exception(query)
+        except Exception as exc:
+            if _is_network_exception(exc):
+                raise NetworkWorkflowError(f"Aliyun GetTaskResult network error: {exc}") from exc
+            raise WorkflowError(f"Aliyun GetTaskResult failed: {exc}") from exc
+
+        try:
+            query_resp = json.loads(query_raw.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise WorkflowError("Aliyun GetTaskResult returned invalid JSON") from exc
+        if not isinstance(query_resp, dict):
+            raise WorkflowError("Aliyun GetTaskResult returned invalid response object")
+
+        query_status = str(query_resp.get("StatusText", "")).upper()
+        if query_status == "SUCCESS":
+            append_log(log_file, "transcribe progress: 98.0%")
+            return _build_transcribe_result_from_aliyun_result(query_resp.get("Result", ""), duration)
+        if query_status in {"FAILED", "FAIL"}:
+            raise WorkflowError(f"Aliyun task failed: {query_resp}")
+        if query_status not in {"RUNNING", "QUEUEING"}:
+            raise WorkflowError(f"Aliyun task returned terminal status: {query_status} | {query_resp}")
+
+        elapsed = time.monotonic() - started
+        if elapsed > cfg.max_wait_seconds:
+            raise NetworkWorkflowError("Aliyun GetTaskResult timed out")
+        pct = min(96.0, 28.0 + (elapsed / cfg.max_wait_seconds) * 68.0)
+        bucket = int(pct // 2)
+        if bucket > last_bucket:
+            last_bucket = bucket
+            append_log(log_file, f"transcribe progress: {pct:.1f}%")
+        time.sleep(cfg.poll_interval_seconds)
+
+
+def run_aliyun_asr_with_retry(
+    *,
+    audio_file: Path,
+    cfg: AliyunASRConfig,
+    log_file: Path,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            append_log(log_file, f"transcribe started aliyun-filetrans (attempt {attempt})")
+            append_log(log_file, "transcribe progress: 0.0%")
+            result = _run_aliyun_asr_once(audio_file, cfg, log_file)
+            append_log(log_file, "transcribe progress: 100.0%")
+            return result
+        except Exception as exc:
+            last_error = exc
+            append_log(log_file, f"aliyun transcribe attempt {attempt} failed: {exc}")
+            if attempt == 2:
+                if _is_network_exception(exc):
+                    raise NetworkWorkflowError(f"Aliyun ASR failed after retry: {exc}") from exc
+                raise WorkflowError(f"Aliyun ASR failed after retry: {exc}") from exc
+    assert last_error is not None
+    raise WorkflowError(f"Aliyun ASR failed: {last_error}")
+
+
+def run_online_asr_with_fallback(
+    *,
+    audio_file: Path,
+    preferred_provider: str,
+    asr_configs: OnlineASRConfigs,
+    log_file: Path,
+) -> tuple[dict, str, list[str]]:
+    def _is_usable_result(result: dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        text = str(result.get("text", "")).strip()
+        segments = result.get("segments", [])
+        return bool(text) or (isinstance(segments, list) and len(segments) > 0)
+
+    if preferred_provider not in ONLINE_ASR_PROVIDERS:
+        preferred_provider = ONLINE_ASR_PROVIDERS[0]
+    provider_sequence: list[str] = [preferred_provider]
+    for provider in ONLINE_ASR_PROVIDERS:
+        if provider != preferred_provider:
+            provider_sequence.append(provider)
+
+    last_error: Exception | None = None
+    attempted_providers: list[str] = []
+    for provider in provider_sequence:
+        attempted_providers.append(provider)
+        try:
+            if provider == "aliyun":
+                if asr_configs.aliyun is None:
+                    raise WorkflowError("aliyun ASR config is missing")
+                append_log(log_file, "Online ASR engine selected: aliyun-filetrans")
+                result = run_aliyun_asr_with_retry(audio_file=audio_file, cfg=asr_configs.aliyun, log_file=log_file)
+                if not _is_usable_result(result):
+                    raise WorkflowError("aliyun ASR returned empty result")
+                return result, provider, attempted_providers
+
+            if provider == "doubao":
+                if asr_configs.doubao is None:
+                    raise WorkflowError("doubao ASR config is missing")
+                append_log(log_file, "Online ASR engine selected: doubao")
+                result = run_doubao_asr_with_retry(audio_file=audio_file, cfg=asr_configs.doubao, log_file=log_file)
+                if not _is_usable_result(result):
+                    raise WorkflowError("doubao ASR returned empty result")
+                return result, provider, attempted_providers
+
+            raise WorkflowError(f"Unsupported online ASR provider: {provider}")
+        except Exception as exc:
+            last_error = exc
+            append_log(log_file, f"Online ASR engine failed [{provider}]: {exc}")
+            append_log(log_file, "Switching to fallback online ASR engine")
+            continue
+
+    if last_error is None:
+        raise WorkflowError("No online ASR provider available")
+    if _is_network_exception(last_error):
+        raise NetworkWorkflowError(f"All online ASR providers failed: {last_error}") from last_error
+    raise WorkflowError(f"All online ASR providers failed: {last_error}") from last_error
 
 
 def _extract_json_array_from_text(raw_text: str) -> list[str]:
@@ -1601,9 +2637,16 @@ def _rightcode_translate_batch(
     zh_lines: Sequence[str],
     cfg: OnlineTranslateConfig,
 ) -> list[str]:
+    glossary_lines = [
+        f"- {k}: {v if k not in {'打包', '形变', '平滑', '衰减'} else {'打包':'pack/packed','形变':'deform/deformation','平滑':'smooth/smoothing','衰减':'falloff/attenuation'}[k]}"
+        for k, v in TRANSLATION_GLOSSARY_MAP.items()
+    ]
     prompt = (
         "你是字幕翻译器。请把输入的中文数组逐条翻译为简短自然英文。"
         "保持数组长度一致、顺序一致。仅返回JSON数组，不要任何额外文本。\n"
+        "请严格遵循术语表翻译：\n"
+        + "\n".join(glossary_lines)
+        + "\n"
         f"输入: {json.dumps(list(zh_lines), ensure_ascii=False)}"
     )
     payload = {
@@ -1681,7 +2724,10 @@ def translate_entries_with_rightcode(
         for item, raw_en in zip(batch, translated):
             duration = max(item.end - item.start, 0.4)
             en_char_budget = max(28, min(72, int(duration * 20)))
-            out.append(compress_en_for_timing(raw_en, max_chars=en_char_budget))
+            merged = apply_translation_glossary(item.text, raw_en)
+            merged = compress_en_for_timing(merged, max_chars=en_char_budget)
+            merged = apply_translation_glossary(item.text, merged)
+            out.append(merged)
 
         done = min(total, offset + len(batch))
         pct = min(99.0, (done / total) * 100.0)
@@ -1774,13 +2820,14 @@ def generate_subtitles_local(
 
         raw_entries = entries_from_whisper_segments(transcribe_result.get("segments", []))
         zh_entries = clean_and_split_zh_entries(raw_entries, max_zh_chars=18)
+        zh_entries = apply_forced_term_mapping_entries(zh_entries)
         if not zh_entries:
             raise WorkflowError("No subtitle entries remained after cleaning")
 
         if not validate_zh_entries(zh_entries):
             # Automatic repair path: re-clean every line and re-split.
             repaired = clean_and_split_zh_entries(normalize_indices(zh_entries), max_zh_chars=18)
-            zh_entries = repaired
+            zh_entries = apply_forced_term_mapping_entries(repaired)
             if not validate_zh_entries(zh_entries):
                 raise WorkflowError("zh subtitle validation failed after auto-repair")
 
@@ -1807,6 +2854,8 @@ def generate_subtitles_local(
 
         en_entries: list[SubtitleEntry] = []
         en_lines: list[str] = []
+        asr_detail = f"Whisper 本地离线转录 model={model_name}, task=transcribe, language=zh"
+        translate_detail = f"Whisper 本地离线翻译 model={model_name}, task=translate, language=zh"
 
         try:
             translate_result = run_whisper_with_retry(
@@ -1819,6 +2868,7 @@ def generate_subtitles_local(
             )
             en_segments = translate_result.get("segments", [])
             en_lines = align_english_to_zh(zh_entries, en_segments)
+            en_lines = apply_forced_term_mapping_lines(en_lines)
             en_entries = [
                 SubtitleEntry(index=entry.index, start=entry.start, end=entry.end, text=en_lines[idx])
                 for idx, entry in enumerate(zh_entries)
@@ -1832,6 +2882,7 @@ def generate_subtitles_local(
             if not verify_alignment(zh_entries, en_entries, bi_entries):
                 append_log(log_file, "Alignment validation failed once, rebuilding en/bi outputs")
                 en_lines = align_english_to_zh(zh_entries, en_segments)
+                en_lines = apply_forced_term_mapping_lines(en_lines)
                 en_entries = [
                     SubtitleEntry(index=entry.index, start=entry.start, end=entry.end, text=en_lines[idx])
                     for idx, entry in enumerate(zh_entries)
@@ -1840,6 +2891,7 @@ def generate_subtitles_local(
                 write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
         except Exception as exc:
             append_log(log_file, f"Translation stage failed, kept zh only: {exc}")
+            translate_detail = f"Whisper 本地离线翻译失败: {exc}"
 
         ensure_srt_parseable(zh_path)
         if en_path.exists():
@@ -1851,6 +2903,8 @@ def generate_subtitles_local(
             base_name,
             asr_mode="local",
             translate_mode="local",
+            asr_detail=asr_detail,
+            translate_detail=translate_detail,
         )
 
         outputs = {
@@ -1877,9 +2931,10 @@ def generate_subtitles_online(
     out_dir: Path,
     raw_dir: Path,
     log_file: Path,
-    asr_cfg: OnlineASRConfig,
+    asr_configs: OnlineASRConfigs,
+    preferred_online_asr_provider: str,
     translate_cfg: OnlineTranslateConfig,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], str]:
     source_file = resolve_audio_file(root, requested_audio)
     audio_file = source_file
     if source_file.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
@@ -1890,21 +2945,23 @@ def generate_subtitles_online(
         append_log(log_file, f"Audio duration: {audio_duration_seconds:.1f}s")
 
     try:
-        transcribe_result = run_doubao_asr_with_retry(
+        transcribe_result, provider_used, attempted_providers = run_online_asr_with_fallback(
             audio_file=audio_file,
-            cfg=asr_cfg,
+            preferred_provider=preferred_online_asr_provider,
+            asr_configs=asr_configs,
             log_file=log_file,
         )
         save_raw_outputs(raw_dir, base_name, transcribe_result)
 
         raw_entries = entries_from_whisper_segments(transcribe_result.get("segments", []))
         zh_entries = clean_and_split_zh_entries(raw_entries, max_zh_chars=18)
+        zh_entries = apply_forced_term_mapping_entries(zh_entries)
         if not zh_entries:
             raise WorkflowError("No subtitle entries remained after online cleaning")
 
         if not validate_zh_entries(zh_entries):
             repaired = clean_and_split_zh_entries(normalize_indices(zh_entries), max_zh_chars=18)
-            zh_entries = repaired
+            zh_entries = apply_forced_term_mapping_entries(repaired)
             if not validate_zh_entries(zh_entries):
                 raise WorkflowError("zh subtitle validation failed after online auto-repair")
 
@@ -1929,9 +2986,28 @@ def generate_subtitles_online(
         terms = extract_terms(full_text)
         terms_path.write_text("\n".join(terms) + ("\n" if terms else ""), encoding="utf-8")
 
+        if provider_used == "aliyun":
+            assert asr_configs.aliyun is not None
+            asr_detail = (
+                "阿里云 录音文件识别"
+                f" (domain={asr_configs.aliyun.domain}, version={asr_configs.aliyun.version},"
+                f" region={asr_configs.aliyun.region_id}, appkey={asr_configs.aliyun.appkey})"
+            )
+        else:
+            assert asr_configs.doubao is not None
+            asr_detail = (
+                "豆包 ASR"
+                f" (api_version={asr_configs.doubao.api_version}, recognize_url={asr_configs.doubao.recognize_url})"
+            )
+
         translate_mode = "online"
+        translate_detail = (
+            "在线翻译 RightCode"
+            f" (base_url={translate_cfg.base_url}, model={translate_cfg.model})"
+        )
         try:
             en_lines = translate_entries_with_rightcode(zh_entries, translate_cfg, log_file)
+            en_lines = apply_forced_term_mapping_lines(en_lines)
             en_entries = [
                 SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
                 for idx, item in enumerate(zh_entries)
@@ -1943,6 +3019,7 @@ def generate_subtitles_online(
             if not verify_alignment(zh_entries, en_entries, bi_entries):
                 append_log(log_file, "Alignment validation failed once, rebuilding online en/bi outputs")
                 en_lines = translate_entries_with_rightcode(zh_entries, translate_cfg, log_file)
+                en_lines = apply_forced_term_mapping_lines(en_lines)
                 en_entries = [
                     SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
                     for idx, item in enumerate(zh_entries)
@@ -1960,6 +3037,7 @@ def generate_subtitles_online(
                     log_file=log_file,
                     audio_duration_seconds=audio_duration_seconds,
                 )
+                en_lines = apply_forced_term_mapping_lines(en_lines)
                 en_entries = [
                     SubtitleEntry(index=item.index, start=item.start, end=item.end, text=en_lines[idx])
                     for idx, item in enumerate(zh_entries)
@@ -1967,23 +3045,39 @@ def generate_subtitles_online(
                 write_srt(en_entries, en_path)
                 write_srt(zh_entries, bi_path, bilingual=True, en_lines=en_lines)
                 translate_mode = "local"
+                local_model_name = choose_model_name(model_dir, model_size)
+                translate_detail = (
+                    "本地翻译回退 Whisper"
+                    f" (model={local_model_name}, task=translate, language=zh)"
+                )
 
                 bi_entries = parse_srt(bi_path)
                 if not verify_alignment(zh_entries, en_entries, bi_entries):
                     append_log(log_file, "Alignment validation failed after local translate fallback")
             except Exception as fallback_exc:
                 append_log(log_file, f"Local translate fallback failed, kept zh only: {fallback_exc}")
+                translate_detail = f"在线翻译失败且本地回退失败: {fallback_exc}"
 
         ensure_srt_parseable(zh_path)
         if en_path.exists():
             ensure_srt_parseable(en_path)
         if bi_path.exists():
             ensure_srt_parseable(bi_path)
+        fallback_detail: str | None = None
+        if len(attempted_providers) > 1:
+            fallback_detail = (
+                "在线识别自动切换: "
+                + " -> ".join(attempted_providers)
+                + f"；最终使用 {provider_used}"
+            )
         backend_report_path = write_backend_report(
             media_out_dir,
             base_name,
-            asr_mode="online",
+            asr_mode=f"online({provider_used})",
             translate_mode=translate_mode,
+            asr_detail=asr_detail,
+            translate_detail=translate_detail,
+            fallback_detail=fallback_detail,
         )
 
         outputs = {
@@ -1997,7 +3091,7 @@ def generate_subtitles_online(
             outputs["en"] = en_path
         if bi_path.exists():
             outputs["bi"] = bi_path
-        return outputs
+        return outputs, provider_used
     finally:
         release_runtime(None, log_file)
 
@@ -2012,15 +3106,16 @@ def run_single_media_with_backends(
     raw_dir: Path,
     log_file: Path,
     backends: RuntimeBackends,
-    asr_cfg: OnlineASRConfig | None,
+    asr_configs: OnlineASRConfigs | None,
     translate_cfg: OnlineTranslateConfig | None,
 ) -> tuple[dict[str, Path], RuntimeBackends]:
     if backends.asr_mode == "online":
-        if asr_cfg is None or translate_cfg is None:
+        if asr_configs is None or translate_cfg is None:
             raise WorkflowError("Online mode selected but online config is missing")
+        preferred_provider = backends.online_asr_provider or "doubao"
         for attempt in (1, 2):
             try:
-                outputs = generate_subtitles_online(
+                outputs, provider_used = generate_subtitles_online(
                     root=root,
                     requested_audio=str(media),
                     model_size=model_size,
@@ -2028,10 +3123,15 @@ def run_single_media_with_backends(
                     out_dir=out_dir,
                     raw_dir=raw_dir,
                     log_file=log_file,
-                    asr_cfg=asr_cfg,
+                    asr_configs=asr_configs,
+                    preferred_online_asr_provider=preferred_provider,
                     translate_cfg=translate_cfg,
                 )
-                return outputs, backends
+                return outputs, RuntimeBackends(
+                    asr_mode="online",
+                    translate_mode=backends.translate_mode,
+                    online_asr_provider=provider_used,
+                )
             except WorkflowError as exc:
                 append_log(log_file, f"Online mode failed attempt {attempt}: {exc}")
                 if attempt == 1 and _is_network_exception(exc):
@@ -2081,6 +3181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Online ASR config JSON path",
     )
     parser.add_argument(
+        "--online-asr-provider",
+        choices=["auto", "doubao", "aliyun"],
+        default="auto",
+        help="Online ASR provider: auto asks at startup, 1=doubao 2=aliyun",
+    )
+    parser.add_argument(
         "--online-translate-config",
         default=DEFAULT_ONLINE_TRANSLATE_CONFIG,
         help="Online translate config JSON path",
@@ -2112,13 +3218,26 @@ def main() -> int:
         else:
             selected_mode = "local"
 
-        backends = RuntimeBackends(asr_mode=selected_mode, translate_mode=selected_mode)
-        append_log(log_file, f"Runtime mode selected: {backends.asr_mode}")
+        selected_online_asr_provider: str | None = None
+        if selected_mode == "online":
+            if args.online_asr_provider == "auto":
+                selected_online_asr_provider = choose_online_asr_provider_interactive(timeout_seconds=5)
+            else:
+                selected_online_asr_provider = args.online_asr_provider
 
-        asr_cfg: OnlineASRConfig | None = None
+        backends = RuntimeBackends(
+            asr_mode=selected_mode,
+            translate_mode=selected_mode,
+            online_asr_provider=selected_online_asr_provider,
+        )
+        append_log(log_file, f"Runtime mode selected: {backends.asr_mode}")
+        if backends.online_asr_provider:
+            append_log(log_file, f"Online ASR provider selected: {backends.online_asr_provider}")
+
+        asr_configs: OnlineASRConfigs | None = None
         translate_cfg: OnlineTranslateConfig | None = None
         if backends.asr_mode == "online":
-            asr_cfg = load_online_asr_config((root / args.online_asr_config).resolve())
+            asr_configs = load_online_asr_configs((root / args.online_asr_config).resolve())
             translate_cfg = load_online_translate_config((root / args.online_translate_config).resolve())
             append_log(log_file, "Online ASR/translate config loaded")
 
@@ -2138,7 +3257,7 @@ def main() -> int:
                     raw_dir=raw_dir,
                     log_file=log_file,
                     backends=backends,
-                    asr_cfg=asr_cfg,
+                    asr_configs=asr_configs,
                     translate_cfg=translate_cfg,
                 )
                 append_log(
@@ -2163,3 +3282,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

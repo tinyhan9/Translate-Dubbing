@@ -1,7 +1,7 @@
 {
   "rightcode_translate": {
     "api_key": "",
-    "base_url": "",
+    "base_url": "https://right.codes/codex/v1",
     "model": "gpt-5.2",
     "timeout_seconds": 90,
     "batch_size": 20

@@ -1,6 +1,20 @@
 {
+  "aliyun_asr": {
+    "appkey": "",
+    "access_key_id": "",
+    "access_key_secret": "",
+    "region_id": "cn-shanghai",
+    "domain": "filetrans.cn-shanghai.aliyuncs.com",
+    "version": "2018-08-17",
+    "upload_enabled": true,
+    "upload_endpoint": "https://catbox.moe/user/api.php",
+    "upload_timeout_seconds": 180,
+    "poll_interval_seconds": 2.0,
+    "max_wait_seconds": 1800,
+    "request_timeout_seconds": 120
+  },
   "doubao_asr": {
-    "app_id": "",
+    "app_id": "9918299500",
     "access_token": "",
     "secret_key": "",
     "api_version": "v3_flash",
