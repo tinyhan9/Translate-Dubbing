@@ -13,7 +13,7 @@ if not exist "%PYTHON_EXE%" (
   exit /b 1
 )
 
-"%PYTHON_EXE%" -m app.subtitle_workflow --root . --model-dir models/whisper --out-dir output --raw-dir .transcripts/raw --log-file .transcripts/error.log --open-progress-window
+"%PYTHON_EXE%" -m app.subtitle_workflow --root . --model-dir models/whisper --online-asr-config config/online_asr.json --online-translate-config config/online_translate.json --out-dir output --raw-dir .transcripts/raw --log-file .transcripts/error.log --open-progress-window
 set "CODE=%ERRORLEVEL%"
 
 if not "%CODE%"=="0" (

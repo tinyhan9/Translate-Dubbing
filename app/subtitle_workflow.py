@@ -3237,9 +3237,20 @@ def main() -> int:
         asr_configs: OnlineASRConfigs | None = None
         translate_cfg: OnlineTranslateConfig | None = None
         if backends.asr_mode == "online":
-            asr_configs = load_online_asr_configs((root / args.online_asr_config).resolve())
-            translate_cfg = load_online_translate_config((root / args.online_translate_config).resolve())
-            append_log(log_file, "Online ASR/translate config loaded")
+            asr_config_path = (root / args.online_asr_config).resolve()
+            translate_config_path = (root / args.online_translate_config).resolve()
+            if asr_config_path == translate_config_path:
+                raise WorkflowError(
+                    "Online ASR config and online translate config must be different files. "
+                    f"Got same path: {asr_config_path}"
+                )
+            asr_configs = load_online_asr_configs(asr_config_path)
+            translate_cfg = load_online_translate_config(translate_config_path)
+            append_log(
+                log_file,
+                "Online config loaded | "
+                f"asr={asr_config_path} | translate={translate_config_path}",
+            )
 
         queue = resolve_audio_queue(root, args.audio)
         append_log(log_file, f"Queue prepared: {len(queue)} media file(s)")

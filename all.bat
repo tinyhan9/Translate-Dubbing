@@ -38,7 +38,7 @@ for /r ".\start" %%F in (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.mp4 *.mkv *.ts *
 
     call :now_iso AGENTS_MD_START_TS
 
-    "!PYTHON_EXE!" -m app.subtitle_workflow "%%~fF" --root . --model-dir models/whisper --out-dir output --raw-dir .transcripts/raw --log-file .transcripts/error.log --open-progress-window
+    "!PYTHON_EXE!" -m app.subtitle_workflow "%%~fF" --root . --model-dir models/whisper --online-asr-config config/online_asr.json --online-translate-config config/online_translate.json --out-dir output --raw-dir .transcripts/raw --log-file .transcripts/error.log --open-progress-window
     if errorlevel 1 (
       echo [ERROR] AGENT1 failed: %%~fF
       exit /b 1
