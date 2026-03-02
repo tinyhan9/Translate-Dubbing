@@ -3,7 +3,7 @@
 仅 Windows 系统使用。
 
 # 使用说明
-1. 视频或者音频放入 `start` 文件夹。
+1. 视频或者音频放入 `start` 文件夹（若没有，在根目录手动创建）。
 2. 双击 `agent.bat`，等待运行后在 `output` 文件夹获得中文字幕、英文字幕、双语字幕。
 3. 双击 `agent2.bat`，等待运行后在 `output` 文件夹获得英文配音。  
    前提：`output` 文件夹要有英文的 `.srt` 字幕文件，且 `ref-audio` 要有一个参考音色。
@@ -13,7 +13,7 @@
 7. 在线识别配置的设置在\config内修改，默认配置设置模式：语音识别为豆包，翻译为第三方API（需自行配置）。
 
 # 其他说明
-0. 模型放到 `models` 文件夹，下载 `indexTTS2`、`whisper`、`hf_cache`。
+0. 模型放到 `models` 文件夹（若没有，在根目录手动创建），下载 `indexTTS2`、`whisper`、`hf_cache`；依赖环境解压到根目录。
 1. `ref-audio` 放置参考音色的音频文件，根目录下仅放置一个即可，如 `ref-audio\TINY.wav'。
 2. 双击运行 `cleanup_start.bat`，会清理 `start` 文件夹内所有文件。
 3. 双击运行 `cleanup_workspace_full.bat`，会清理 `output` 生成的文件和其他缓存。
@@ -23,5 +23,10 @@
 7. 在线识别失败转为本地识别。
 
 # 模型下载地址
-https://pan.baidu.com/s/1TgxvKX5LQL4iV_ROVr2UFA?pwd=8mzd  
+https://pan.baidu.com/s/1CSM6VnBOkQfOyrdT6Ab2Uw?pwd=pyix 提取码: pyix 
 默认情况下，程序未读取到模型会自动下载(强烈建议网盘下载)。
+
+# 依赖下载地址
+链接: https://pan.baidu.com/s/1QFbLMR-0MtWHuGs00LWN7g 提取码: hdzf 
+
+
