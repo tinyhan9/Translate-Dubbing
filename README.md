@@ -23,8 +23,7 @@
 7. 在线识别失败转为本地识别。
 
 # 模型下载地址
-https://pan.baidu.com/s/1CSM6VnBOkQfOyrdT6Ab2Uw?pwd=pyix 提取码: pyix 
-默认情况下，程序未读取到模型会自动下载(强烈建议网盘下载)。
+https://pan.baidu.com/s/1KbXf9xcoHL1Hph933UagyA?pwd=f6sp 提取码: f6sp 
 
 # 环境依赖下载地址（必需）
 https://pan.baidu.com/s/1mwViPgIuEj4TpzRc5nMYEg?pwd=2wxa 提取码: 2wxa 
